@@ -1,0 +1,32 @@
+# Database Rules
+
+Use MySQL with Prisma.
+
+All tenant-owned tables must include:
+- tenantId
+- createdAt
+- updatedAt
+- deletedAt where soft delete is needed
+- createdById where useful
+- updatedById where useful
+
+Add indexes:
+- tenantId
+- tenantId + status
+- tenantId + createdAt
+- tenantId + email where needed
+
+Use tenant-safe unique constraints.
+Examples:
+- tenantId + email
+- tenantId + slug
+
+Do not create global unique constraints for tenant-owned data unless required.
+
+Use migrations for schema changes.
+Do not manually change database schema without Prisma migration.
+
+Prefer soft delete for business records.
+Use hard delete only for safe system cleanup.
+
+Every service query for tenant data must include tenantId.

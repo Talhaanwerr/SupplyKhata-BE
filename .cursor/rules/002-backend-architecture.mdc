@@ -1,0 +1,34 @@
+# Backend Architecture Rules
+
+Use clean NestJS modular architecture.
+
+Preferred flow:
+Controller -> Service -> Repository/Prisma -> Database
+
+Controllers:
+- Only handle request, response, params, query, body, and decorators.
+- Do not write business logic in controllers.
+- Do not directly access Prisma in controllers.
+
+Services:
+- Put business logic in services.
+- Keep methods small and readable.
+- Use dependency injection.
+- Avoid duplicate logic.
+
+DTOs:
+- Every create/update API must use DTOs.
+- Use class-validator validation.
+- Never accept raw unvalidated request bodies.
+
+Modules:
+- Each feature should have its own module.
+- Use clear names: auth, users, tenants, roles, permissions, audit-logs, files, settings, subscriptions, notifications etc.
+
+Responses:
+- Use a consistent API response format.
+- Use pagination for list APIs.
+- Never expose internal stack traces to users.
+
+Use DRY and SOLID principles.
+Avoid `any` unless there is a strong reason and explain it with a comment.

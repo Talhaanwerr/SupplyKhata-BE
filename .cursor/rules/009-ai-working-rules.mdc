@@ -1,0 +1,30 @@
+# AI Working Rules
+
+Before coding:
+- inspect existing files
+- understand current structure
+- follow existing naming and patterns
+- avoid rewriting unrelated code
+
+When making changes:
+- keep changes focused
+- do not break existing APIs
+- do not remove existing features without asking
+- prefer incremental implementation
+- add types for all new code
+- handle errors properly
+- keep tenant isolation in mind
+
+After coding:
+- explain what changed
+- mention files changed
+- mention commands to run
+- mention any migration needed
+- mention any env variable added
+
+If unsure:
+- make a safe assumption
+- add a clear TODO
+- do not invent fake package APIs
+
+For every frontend change, ensure the UI is fully responsive on mobile, tablet, laptop, and desktop.

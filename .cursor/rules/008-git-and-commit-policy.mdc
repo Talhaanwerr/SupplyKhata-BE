@@ -1,0 +1,25 @@
+# Git and Commit Rules
+
+Use conventional commits.
+
+Examples:
+- feat: add tenant module
+- fix: resolve refresh token rotation
+- refactor: clean auth service
+- chore: update eslint config
+- test: add permission guard tests
+
+Before commit:
+- run lint
+- run type-check
+- run tests if available
+- ensure no secrets are committed
+- ensure .env files are ignored
+
+Never commit:
+- .env
+- private keys
+- database dumps
+- access tokens
+- refresh tokens
+- API secrets

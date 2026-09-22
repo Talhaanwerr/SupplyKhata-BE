@@ -1,0 +1,31 @@
+# Code Quality Rules
+
+Use TypeScript strict mode.
+
+Avoid:
+- any
+- duplicated code
+- huge files
+- huge functions
+- business logic in controllers or components
+- hardcoded strings repeated everywhere
+- magic numbers
+- unused imports
+- commented dead code
+
+Prefer:
+- small functions
+- clear names
+- shared constants
+- reusable helpers
+- typed DTOs
+- typed API responses
+- clean folder structure
+- readable error messages
+
+Before finishing a task:
+- run lint
+- run type-check
+- run tests if available
+- update related types
+- update README or docs if setup changed

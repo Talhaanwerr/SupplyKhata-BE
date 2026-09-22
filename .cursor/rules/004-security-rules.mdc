@@ -1,0 +1,33 @@
+# Security Rules
+
+Security is highest priority.
+
+Backend must include:
+- Helmet
+- strict CORS whitelist from env
+- request body size limit
+- global validation pipe
+- rate limiting
+- secure error responses
+- password hashing with argon2 or bcrypt
+- refresh token rotation
+- account lockout after repeated failed login attempts
+- audit logs for important actions
+- tenant isolation on every tenant-owned query
+- RBAC and permission guards
+- file upload validation
+- environment variable validation
+
+Never:
+- commit secrets
+- log passwords, tokens, OTPs, refresh tokens, or private keys
+- expose stack traces in production
+- return data from another tenant
+- trust frontend permissions
+- accept raw request body without DTO validation
+
+Frontend:
+- Do not put private secrets in NEXT_PUBLIC envs.
+- Avoid storing refresh tokens in localStorage.
+- Sanitize user-generated content.
+- Add 403 page and suspended account page.

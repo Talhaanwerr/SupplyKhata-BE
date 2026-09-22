@@ -1,0 +1,17 @@
+---
+description: Known pitfalls and fixed bugs Cursor must avoid repeating
+alwaysApply: true
+---
+
+# Known Pitfalls
+
+Always read and follow `cursor-pitfalls.md` at the project root.
+
+Before changing auth, API client, CSP, env validation, mailer, file storage, ports, login forms, Prisma, seed data, or DTO money/number validation, check that file.
+
+When you fix a real bug in this project:
+1. Append a new numbered point to `cursor-pitfalls.md`
+2. Keep the point short
+3. State the wrong pattern and the correct pattern
+
+Do not reintroduce issues already listed there.

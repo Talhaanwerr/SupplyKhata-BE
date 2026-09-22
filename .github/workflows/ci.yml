@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  ci:
+    name: Install · Lint · Type-check · Test · Build
+    runs-on: ubuntu-latest
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: rootpassword
+          MYSQL_DATABASE: saas_db_test
+          MYSQL_USER: saas_user
+          MYSQL_PASSWORD: saas_password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    env:
+      NODE_ENV: test
+      DATABASE_URL: mysql://saas_user:saas_password@127.0.0.1:3306/saas_db_test
+      JWT_SECRET: ci-jwt-secret-at-least-32-chars-long
+      JWT_REFRESH_SECRET: ci-refresh-secret-at-least-32-chars
+      JWT_EXPIRES_IN: 15m
+      JWT_REFRESH_EXPIRES_IN: 7d
+      CORS_ORIGINS: http://localhost:3010
+      MAIL_HOST: localhost
+      MAIL_PORT: 1025
+      MAIL_USER: ''
+      MAIL_PASS: ''
+      MAIL_FROM: noreply@test.local
+      MAIL_FROM_NAME: Test
+      FRONTEND_URL: http://localhost:3010
+      THROTTLE_TTL: 60000
+      THROTTLE_LIMIT: 100
+      LOGIN_MAX_ATTEMPTS: 5
+      LOGIN_LOCKOUT_MINUTES: 15
+      STORAGE_DRIVER: local
+      UPLOAD_DIR: /tmp/uploads
+      MAX_FILE_SIZE_MB: 10
+      LOG_LEVEL: error
+      SWAGGER_ENABLED: 'false'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Lint
+        run: npm run lint:check
+
+      - name: Type-check
+        run: npm run type-check
+
+      - name: Run migrations (test DB)
+        run: npx prisma migrate deploy
+
+      - name: Unit tests
+        run: npm run test -- --passWithNoTests --forceExit
+
+      - name: E2E tests
+        run: npm run test:e2e -- --passWithNoTests --forceExit
+
+      - name: Build
+        run: npm run build

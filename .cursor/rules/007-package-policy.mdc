@@ -1,0 +1,37 @@
+# Package Policy
+
+When installing packages:
+- Use stable versions.
+- Prefer latest stable version compatible with the current Node.js LTS.
+- Avoid deprecated packages.
+- Avoid packages with low maintenance or security risks.
+- Prefer official or widely-used libraries.
+- Check if the package is actually needed before installing.
+- Do not add multiple libraries for the same purpose.
+- Update package.json scripts when needed.
+- After install, run lint, type-check, and build.
+
+Preferred packages:
+
+Backend:
+- @nestjs/*
+- prisma
+- @prisma/client
+- argon2 or bcrypt
+- helmet
+- class-validator
+- class-transformer
+- @nestjs/throttler
+- pino or winston
+- zod if needed
+
+Frontend:
+- next
+- react
+- tailwindcss
+- shadcn/ui
+- react-hook-form
+- zod
+- @tanstack/react-query
+- zustand
+- lucide-react

@@ -1,0 +1,29 @@
+# Project Overview
+
+This project is a reusable multi-tenant SaaS boilerplate.
+
+Backend:
+- NestJS
+- TypeScript strict mode
+- MySQL
+- Prisma ORM
+- JWT authentication
+- RBAC and permission-based authorization
+
+Frontend:
+- Next.js App Router
+- TypeScript strict mode
+- Tailwind CSS
+- shadcn/ui
+- React Hook Form
+- Zod
+- TanStack Query
+
+The platform has three user levels:
+1. Super Admin: founder/platform owner
+2. Tenant Owner/Admin: school or business owner
+3. Tenant Users: employees, teachers, accountants, managers, etc.
+
+Always design features as reusable SaaS modules.
+Do not hardcode school-only or ERP-only logic in the core boilerplate.
+Core modules should support future products like School Management, ERP, CRM, HRM, Inventory, Billing, and similar SaaS products.

@@ -1,0 +1,857 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ────────────────────────────────────────────────────
+
+enum TenantStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  CANCELLED
+}
+
+enum MemberStatus {
+  INVITED
+  ACTIVE
+  INACTIVE
+}
+
+enum SubscriptionStatus {
+  TRIAL
+  ACTIVE
+  PAST_DUE
+  CANCELLED
+  EXPIRED
+}
+
+enum BillingCycle {
+  MONTHLY
+  YEARLY
+  LIFETIME
+}
+
+enum CustomerStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum PaymentCycle {
+  CASH_ON_DELIVERY
+  WEEKLY
+  FORTNIGHTLY
+  MONTHLY
+  CUSTOM
+}
+
+enum VehicleStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum StockType {
+  OPENING
+  CLOSING
+}
+
+enum RunStatus {
+  OPEN
+  CLOSED
+}
+
+enum PaymentMethod {
+  CASH
+  BANK
+  EASYPAISA
+  JAZZCASH
+  OTHER
+}
+
+enum DeliveryStatus {
+  DELIVERED
+  PARTIAL
+  FAILED
+  CANCELLED
+}
+
+enum ContainerMovementType {
+  DELIVERED_TO_CUSTOMER
+  RETURNED_FROM_CUSTOMER
+  LOADED_TO_VEHICLE
+  UNLOADED_FROM_VEHICLE
+  LOST
+  DAMAGED
+  ADJUSTMENT
+}
+
+enum LedgerEntryType {
+  DELIVERY_SALE
+  PAYMENT
+  ADJUSTMENT
+  OPENING_BALANCE
+  REFUND
+}
+
+enum FileVisibility {
+  PUBLIC
+  PRIVATE
+}
+
+enum NotificationType {
+  INFO
+  SUCCESS
+  WARNING
+  ERROR
+}
+
+// ─── Tenant ───────────────────────────────────────────────────
+
+model Tenant {
+  id          String       @id @default(cuid())
+  name        String
+  slug        String       @unique
+  domain      String?
+  subdomain   String?      @unique
+  status      TenantStatus @default(PENDING)
+  ownerUserId String?
+  timezone    String       @default("UTC")
+  currency    String       @default("USD")
+  logo        String?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  members               TenantMember[]
+  userSessions          UserSession[]
+  userRoles             UserRole[]
+  subscriptions         Subscription[]
+  settings              TenantSettings?
+  features              TenantFeature[]
+  files                 File[]
+  notifications         Notification[]
+  auditLogs             AuditLog[]
+  areas                 Area[]
+  products              Product[]
+  customers             Customer[]
+  vehicles              Vehicle[]
+  deliveryRuns          DeliveryRun[]
+  deliveries            Delivery[]
+  deliveryRunStocks     DeliveryRunStock[]
+  deliveryItems         DeliveryItem[]
+  containerMovements    ContainerMovement[]
+  customerLedgerEntries CustomerLedgerEntry[]
+  payments              Payment[]
+
+  @@index([status])
+  @@index([createdAt])
+  @@map("tenants")
+}
+
+// ─── User ─────────────────────────────────────────────────────
+// Global user — one record per email address, shared across all tenants.
+// Per-tenant membership and status live in TenantMember.
+
+model User {
+  id              String    @id @default(cuid())
+  email           String    @unique
+  firstName       String
+  lastName        String
+  passwordHash    String
+  isSuperAdmin    Boolean   @default(false)
+  emailVerified   Boolean   @default(false)
+  emailVerifiedAt DateTime?
+  avatarUrl       String?
+  timezone        String?
+  totpSecret      String? // null = TOTP not set up
+  totpEnabled     Boolean   @default(false)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  memberships              TenantMember[]
+  sessions                 UserSession[]
+  roles                    UserRole[]
+  files                    File[]
+  notifications            Notification[]
+  auditLogs                AuditLog[]
+  loginAttempts            LoginAttempt[]
+  defaultRiderForCustomers Customer[]
+  deliveryRunsAsRider      DeliveryRun[]
+  paymentsCollected        Payment[]
+
+  @@index([email])
+  @@map("users")
+}
+
+// ─── TenantMember ─────────────────────────────────────────────
+// Bridge table — links a global User to a Tenant with per-tenant
+// status, invitation metadata, and join date.
+
+model TenantMember {
+  id          String       @id @default(cuid())
+  userId      String
+  tenantId    String
+  status      MemberStatus @default(INVITED)
+  invitedById String?
+  joinedAt    DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, tenantId])
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@map("tenant_members")
+}
+
+// ─── UserSession ──────────────────────────────────────────────
+
+model UserSession {
+  id               String   @id @default(cuid())
+  userId           String
+  tenantId         String? // nullable — SA sessions and reset/verify tokens have no tenant
+  refreshTokenHash String   @db.Text
+  ipAddress        String?
+  userAgent        String?  @db.Text
+  expiresAt        DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tenant Tenant? @relation(fields: [tenantId], references: [id])
+
+  @@index([userId])
+  @@index([tenantId])
+  @@index([expiresAt])
+  @@map("user_sessions")
+}
+
+// ─── Role ─────────────────────────────────────────────────────
+
+model Role {
+  id          String  @id @default(cuid())
+  tenantId    String?
+  name        String
+  slug        String
+  description String?
+  isSystem    Boolean @default(false)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  permissions RolePermission[]
+  userRoles   UserRole[]
+
+  @@unique([tenantId, slug])
+  @@index([tenantId])
+  @@map("roles")
+}
+
+// ─── Permission ───────────────────────────────────────────────
+
+model Permission {
+  id          String  @id @default(cuid())
+  module      String
+  action      String
+  description String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  roles RolePermission[]
+
+  @@unique([module, action])
+  @@index([module])
+  @@map("permissions")
+}
+
+// ─── RolePermission ───────────────────────────────────────────
+
+model RolePermission {
+  id           String @id @default(cuid())
+  roleId       String
+  permissionId String
+
+  createdAt DateTime @default(now())
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@unique([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+// ─── UserRole ─────────────────────────────────────────────────
+
+model UserRole {
+  id           String  @id @default(cuid())
+  userId       String
+  roleId       String
+  tenantId     String
+  assignedById String?
+
+  createdAt DateTime @default(now())
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role   Role   @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@unique([userId, roleId, tenantId])
+  @@index([userId])
+  @@index([tenantId])
+  @@map("user_roles")
+}
+
+// ─── Plan ─────────────────────────────────────────────────────
+
+model Plan {
+  id           String       @id @default(cuid())
+  name         String
+  slug         String       @unique
+  description  String?
+  price        Decimal      @db.Decimal(10, 2)
+  currency     String       @default("USD")
+  billingCycle BillingCycle @default(MONTHLY)
+  isActive     Boolean      @default(true)
+  features     Json?
+  maxUsers     Int          @default(5)
+  maxStorage   Int          @default(1024)
+  trialDays    Int          @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  subscriptions Subscription[]
+
+  @@index([isActive])
+  @@map("plans")
+}
+
+// ─── Subscription ─────────────────────────────────────────────
+
+model Subscription {
+  id           String             @id @default(cuid())
+  tenantId     String
+  planId       String
+  status       SubscriptionStatus @default(TRIAL)
+  startDate    DateTime
+  endDate      DateTime?
+  trialEndDate DateTime?
+  cancelledAt  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  plan   Plan   @relation(fields: [planId], references: [id])
+
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@map("subscriptions")
+}
+
+// ─── TenantSettings ───────────────────────────────────────────
+
+model TenantSettings {
+  id             String  @id @default(cuid())
+  tenantId       String  @unique
+  orgName        String?
+  logo           String?
+  phone          String?
+  address        String? @db.Text
+  timezone       String  @default("UTC")
+  currency       String  @default("USD")
+  dateFormat     String  @default("YYYY-MM-DD")
+  invoicePrefix  String  @default("INV")
+  themeColor     String  @default("#000000")
+  /// Allowed invite email domains, e.g. ["acme.com","partner.org"]. Empty = any domain.
+  allowedDomains Json    @default("[]")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@map("tenant_settings")
+}
+
+// ─── Area (tenant served areas — not JSON on settings) ────────
+
+model Area {
+  id        String    @id @default(cuid())
+  tenantId  String
+  name      String
+  isActive  Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id])
+  customers Customer[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@index([tenantId, isActive])
+  @@map("areas")
+}
+
+// ─── Product (flat — each water size is its own product) ───────
+
+model Product {
+  id                  String    @id @default(cuid())
+  tenantId            String
+  name                String
+  volume              Decimal?  @db.Decimal(10, 2)
+  unit                String?
+  sku                 String?
+  isActive            Boolean   @default(true)
+  isReturnable        Boolean   @default(true)
+  containerType       String?
+  defaultSellingPrice Decimal   @db.Decimal(10, 2)
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  deletedAt           DateTime?
+
+  tenant             Tenant                 @relation(fields: [tenantId], references: [id])
+  costHistory        ProductCostHistory[]
+  customerPrices     CustomerProductPrice[]
+  deliveryRunStocks  DeliveryRunStock[]
+  deliveryItems      DeliveryItem[]
+  containerMovements ContainerMovement[]
+
+  @@index([tenantId])
+  @@index([tenantId, isActive])
+  @@map("products")
+}
+
+model ProductCostHistory {
+  id            String   @id @default(cuid())
+  tenantId      String
+  productId     String
+  costPerUnit   Decimal  @db.Decimal(10, 2)
+  effectiveFrom DateTime
+  notes         String?
+  createdById   String?
+  createdAt     DateTime @default(now())
+
+  product Product @relation(fields: [productId], references: [id])
+
+  @@index([tenantId, productId])
+  @@index([tenantId, productId, effectiveFrom])
+  @@map("product_cost_history")
+}
+
+// ─── Customer ─────────────────────────────────────────────────
+
+model Customer {
+  id                       String         @id @default(cuid())
+  tenantId                 String
+  name                     String
+  email                    String?
+  phone                    String
+  secondaryPhone           String?
+  address                  String         @db.Text
+  areaId                   String
+  locationNotes            String?        @db.Text
+  status                   CustomerStatus @default(ACTIVE)
+  paymentCycle             PaymentCycle   @default(CASH_ON_DELIVERY)
+  billingDueDate           Int?
+  billingAnchorDate        DateTime?
+  openingReceivableBalance Decimal        @default(0) @db.Decimal(10, 2)
+  containerDeposit         Decimal        @default(0) @db.Decimal(10, 2)
+  defaultRiderId           String?
+  /// Rider-captured promise; overrides cycle due for dashboard until paid/cleared/cancelled
+  promisedDueDate          DateTime?
+  promisedDueAmount        Decimal?       @db.Decimal(10, 2)
+  promisedDueDeliveryId    String?
+  createdAt                DateTime       @default(now())
+  updatedAt                DateTime       @updatedAt
+  deletedAt                DateTime?
+
+  tenant              Tenant                 @relation(fields: [tenantId], references: [id])
+  area                Area                   @relation(fields: [areaId], references: [id])
+  defaultRider        User?                  @relation(fields: [defaultRiderId], references: [id])
+  promisedDueDelivery Delivery?              @relation("PromisedDueSource", fields: [promisedDueDeliveryId], references: [id], onDelete: SetNull)
+  productPrices       CustomerProductPrice[]
+  deliveries          Delivery[]
+  containerMovements  ContainerMovement[]
+  ledgerEntries       CustomerLedgerEntry[]
+  payments            Payment[]
+
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@index([tenantId, areaId])
+  @@index([tenantId, promisedDueDate])
+  @@map("customers")
+}
+
+model CustomerProductPrice {
+  id           String   @id @default(cuid())
+  tenantId     String
+  customerId   String
+  productId    String
+  pricePerUnit Decimal  @db.Decimal(10, 2)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  customer Customer @relation(fields: [customerId], references: [id])
+  product  Product  @relation(fields: [productId], references: [id])
+
+  @@unique([customerId, productId])
+  @@index([tenantId, customerId])
+  @@map("customer_product_prices")
+}
+
+// ─── Vehicle (loaders / delivery vehicles) ────────────────────
+
+model Vehicle {
+  id          String        @id @default(cuid())
+  tenantId    String
+  name        String
+  plateNumber String?
+  type        String?
+  status      VehicleStatus @default(ACTIVE)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  deletedAt   DateTime?
+
+  tenant            Tenant              @relation(fields: [tenantId], references: [id])
+  deliveryRuns      DeliveryRun[]
+  ContainerMovement ContainerMovement[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@map("vehicles")
+}
+
+// ─── Delivery Domain ─────────────────────────────────────────
+
+model DeliveryRun {
+  id                 String    @id @default(cuid())
+  tenantId           String
+  riderId            String
+  vehicleId          String
+  date               DateTime
+  openingCash        Decimal   @default(0) @db.Decimal(10, 2)
+  status             RunStatus @default(OPEN)
+  closingCash        Decimal?  @db.Decimal(10, 2)
+  totalSales         Decimal   @default(0) @db.Decimal(10, 2)
+  totalCashCollected Decimal   @default(0) @db.Decimal(10, 2)
+  totalExpenses      Decimal   @default(0) @db.Decimal(10, 2)
+  notes              String?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  tenant     Tenant             @relation(fields: [tenantId], references: [id])
+  rider      User               @relation(fields: [riderId], references: [id])
+  vehicle    Vehicle            @relation(fields: [vehicleId], references: [id])
+  stocks     DeliveryRunStock[]
+  deliveries Delivery[]
+
+  @@index([tenantId])
+  @@index([tenantId, riderId])
+  @@index([tenantId, date])
+  @@index([tenantId, status])
+  @@map("delivery_runs")
+}
+
+model DeliveryRunStock {
+  id            String    @id @default(cuid())
+  tenantId      String
+  deliveryRunId String
+  productId     String
+  stockType     StockType
+  filledCount   Int       @default(0)
+  emptyCount    Int       @default(0)
+
+  tenant      Tenant      @relation(fields: [tenantId], references: [id])
+  deliveryRun DeliveryRun @relation(fields: [deliveryRunId], references: [id])
+  product     Product     @relation(fields: [productId], references: [id])
+
+  @@unique([deliveryRunId, productId, stockType])
+  @@index([tenantId])
+  @@index([productId])
+  @@map("delivery_run_stocks")
+}
+
+model Delivery {
+  id               String         @id @default(cuid())
+  tenantId         String
+  deliveryRunId    String
+  customerId       String
+  deliveryDate     DateTime
+  cashReceived     Decimal        @default(0) @db.Decimal(10, 2)
+  paymentMethod    PaymentMethod  @default(CASH)
+  status           DeliveryStatus @default(DELIVERED)
+  notes            String?
+  /// Optional: customer promised to pay on this date (does NOT create ledger/payment)
+  promisedPayDate  DateTime?
+  promisedAmount   Decimal?       @db.Decimal(10, 2)
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  tenant                   Tenant     @relation(fields: [tenantId], references: [id])
+  deliveryRun              DeliveryRun @relation(fields: [deliveryRunId], references: [id])
+  customer                 Customer   @relation(fields: [customerId], references: [id])
+  items                    DeliveryItem[]
+  customersWithThisPromise Customer[] @relation("PromisedDueSource")
+
+  @@index([tenantId])
+  @@index([tenantId, deliveryRunId])
+  @@index([tenantId, customerId])
+  @@index([tenantId, deliveryDate])
+  @@map("deliveries")
+}
+
+model DeliveryItem {
+  id                   String   @id @default(cuid())
+  tenantId             String
+  deliveryId           String
+  productId            String
+  quantityDelivered    Int
+  emptiesReceived      Int      @default(0)
+  sellingPriceSnapshot Decimal  @db.Decimal(10, 2)
+  unitCostSnapshot     Decimal  @db.Decimal(10, 2)
+  lineTotal            Decimal  @db.Decimal(10, 2)
+  createdAt            DateTime @default(now())
+
+  tenant             Tenant              @relation(fields: [tenantId], references: [id])
+  delivery           Delivery            @relation(fields: [deliveryId], references: [id])
+  product            Product             @relation(fields: [productId], references: [id])
+  containerMovements ContainerMovement[]
+
+  @@index([tenantId])
+  @@index([tenantId, deliveryId])
+  @@index([tenantId, productId])
+  @@map("delivery_items")
+}
+
+model ContainerMovement {
+  id             String                @id @default(cuid())
+  tenantId       String
+  productId      String
+  deliveryItemId String?
+  customerId     String?
+  vehicleId      String?
+  movementType   ContainerMovementType
+  quantity       Int
+  notes          String?
+  createdAt      DateTime              @default(now())
+
+  tenant       Tenant        @relation(fields: [tenantId], references: [id])
+  product      Product       @relation(fields: [productId], references: [id])
+  deliveryItem DeliveryItem? @relation(fields: [deliveryItemId], references: [id])
+  customer     Customer?     @relation(fields: [customerId], references: [id])
+  vehicle      Vehicle?      @relation(fields: [vehicleId], references: [id])
+
+  @@index([tenantId, productId])
+  @@index([tenantId, customerId, productId])
+  @@index([tenantId, movementType])
+  @@map("container_movements")
+}
+
+model CustomerLedgerEntry {
+  id            String          @id @default(cuid())
+  tenantId      String
+  customerId    String
+  entryType     LedgerEntryType
+  amount        Decimal         @db.Decimal(10, 2)
+  referenceId   String?
+  referenceType String?
+  notes         String?
+  createdAt     DateTime        @default(now())
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id])
+  customer Customer @relation(fields: [customerId], references: [id])
+
+  @@index([tenantId, customerId])
+  @@index([tenantId, customerId, createdAt])
+  @@map("customer_ledger_entries")
+}
+
+// ─── Payment (standalone customer payments) ───────────────────
+// Customer receivable balance = SUM(CustomerLedgerEntry.amount). Never store an editable balance.
+
+model Payment {
+  id            String        @id @default(cuid())
+  tenantId      String
+  customerId    String
+  amount        Decimal       @db.Decimal(10, 2)
+  paymentDate   DateTime
+  method        PaymentMethod
+  collectedById String?
+  reference     String?
+  notes         String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  tenant      Tenant   @relation(fields: [tenantId], references: [id])
+  customer    Customer @relation(fields: [customerId], references: [id])
+  collectedBy User?    @relation(fields: [collectedById], references: [id])
+
+  @@index([tenantId])
+  @@index([tenantId, customerId])
+  @@index([tenantId, paymentDate])
+  @@map("payments")
+}
+
+// ─── PlatformSettings (singleton — Super Admin platform prefs) ─
+
+model PlatformSettings {
+  id              String @id @default("platform")
+  appName         String @default("SaaS Boilerplate")
+  supportEmail    String @default("support@example.com")
+  defaultTimezone String @default("UTC")
+  defaultCurrency String @default("USD")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("platform_settings")
+}
+
+// ─── FeatureFlag ──────────────────────────────────────────────
+
+model FeatureFlag {
+  id          String  @id @default(cuid())
+  name        String
+  slug        String  @unique
+  description String?
+  isGlobal    Boolean @default(false)
+  isActive    Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenantFeatures TenantFeature[]
+
+  @@index([isActive])
+  @@map("feature_flags")
+}
+
+// ─── TenantFeature ────────────────────────────────────────────
+
+model TenantFeature {
+  id            String  @id @default(cuid())
+  tenantId      String
+  featureFlagId String
+  isEnabled     Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant      Tenant      @relation(fields: [tenantId], references: [id])
+  featureFlag FeatureFlag @relation(fields: [featureFlagId], references: [id])
+
+  @@unique([tenantId, featureFlagId])
+  @@index([tenantId])
+  @@map("tenant_features")
+}
+
+// ─── File ─────────────────────────────────────────────────────
+
+model File {
+  id           String         @id @default(cuid())
+  tenantId     String
+  uploadedById String
+  originalName String
+  storedName   String
+  mimeType     String
+  size         Int
+  path         String         @db.Text
+  visibility   FileVisibility @default(PRIVATE)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  tenant     Tenant @relation(fields: [tenantId], references: [id])
+  uploadedBy User   @relation(fields: [uploadedById], references: [id])
+
+  @@index([tenantId])
+  @@index([tenantId, createdAt])
+  @@map("files")
+}
+
+// ─── Notification ─────────────────────────────────────────────
+
+model Notification {
+  id       String           @id @default(cuid())
+  tenantId String
+  userId   String
+  title    String
+  body     String           @db.Text
+  type     NotificationType @default(INFO)
+  isRead   Boolean          @default(false)
+  readAt   DateTime?
+  link     String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, userId])
+  @@index([tenantId, isRead])
+  @@index([tenantId, createdAt])
+  @@map("notifications")
+}
+
+// ─── AuditLog ─────────────────────────────────────────────────
+
+model AuditLog {
+  id        String  @id @default(cuid())
+  tenantId  String?
+  userId    String?
+  action    String
+  module    String
+  entityId  String?
+  oldValue  Json?
+  newValue  Json?
+  ipAddress String?
+  userAgent String? @db.Text
+
+  createdAt DateTime @default(now())
+
+  tenant Tenant? @relation(fields: [tenantId], references: [id])
+  user   User?   @relation(fields: [userId], references: [id])
+
+  @@index([tenantId])
+  @@index([tenantId, module])
+  @@index([tenantId, userId])
+  @@index([tenantId, createdAt])
+  @@map("audit_logs")
+}
+
+// ─── LoginAttempt ─────────────────────────────────────────────
+
+model LoginAttempt {
+  id        String  @id @default(cuid())
+  userId    String?
+  email     String
+  ipAddress String?
+  success   Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([email])
+  @@index([email, createdAt])
+  @@index([ipAddress, createdAt])
+  @@map("login_attempts")
+}

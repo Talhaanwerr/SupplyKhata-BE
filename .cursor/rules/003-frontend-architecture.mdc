@@ -1,0 +1,66 @@
+# Frontend Architecture Rules
+
+Use Next.js App Router with TypeScript strict mode.
+
+Folder structure:
+- app/(auth)
+- app/(super-admin)
+- app/(tenant)
+- components/ui
+- components/layout
+- features
+- hooks
+- lib
+- store
+- types
+- constants
+
+Use:
+- React Hook Form for forms
+- Zod for validation
+- TanStack Query for server state
+- Zustand only for lightweight client state
+- shadcn/ui for UI components
+- Tailwind CSS for styling
+
+Do not put all logic inside pages.
+Move reusable logic into:
+- hooks
+- lib
+- features
+- components
+
+Every page should handle:
+- loading state
+- error state
+- empty state
+- permission state where needed
+
+Do not store secrets in NEXT_PUBLIC variables.
+Never rely only on frontend permission checks. Backend must enforce permissions.
+
+## Responsive UI Rules
+
+All UI must be fully responsive for:
+- desktop
+- laptop
+- tablet
+- mobile
+
+Use mobile-first responsive design.
+
+Every page, layout, table, form, modal, sidebar, header, and dashboard card must work properly on small and large screens.
+
+Responsive requirements:
+- sidebar should collapse into mobile drawer
+- tables should support horizontal scroll or mobile-friendly card layout
+- forms should stack on mobile
+- modals should fit mobile screens
+- buttons should not overflow
+- dashboards should use responsive grid
+- text should remain readable on all screen sizes
+- spacing should adjust for mobile and tablet
+- avoid fixed widths unless necessary
+- use Tailwind responsive classes like sm:, md:, lg:, xl:, 2xl:
+
+Before finishing any frontend task, check responsive behavior for mobile, tablet, and desktop.
