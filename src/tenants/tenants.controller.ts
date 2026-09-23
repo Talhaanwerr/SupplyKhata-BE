@@ -60,6 +60,21 @@ export class TenantsController {
     return this.tenantsService.findOne(id);
   }
 
+  // POST /api/v1/tenants/:id/resend-owner-invite
+  @Post(':id/resend-owner-invite')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Resend owner invite / join email (super admin)',
+    description:
+      'Creates a fresh invite token for pending owners, or re-sends the join notification for active owners.',
+  })
+  @ApiParam({ name: 'id', description: 'Tenant ID' })
+  @ApiResponse({ status: 200, description: 'Email sent' })
+  @ApiResponse({ status: 400, description: 'Mail failed or tenant has no owner' })
+  resendOwnerInvite(@Param('id') id: string, @CurrentUser() user: AuthenticatedUser) {
+    return this.tenantsService.resendOwnerInvite(id, user.id);
+  }
+
   // PATCH /api/v1/tenants/:id
   @Patch(':id')
   @ApiOperation({ summary: 'Update tenant fields' })

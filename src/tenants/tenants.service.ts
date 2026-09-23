@@ -43,6 +43,14 @@ type TenantDetail = TenantListItem & {
     invoicePrefix: string;
   } | null;
   _count: { members: number };
+  owner: {
+    id: string;
+    email: string;
+    firstName: string;
+    lastName: string;
+    memberStatus: string;
+    emailVerified: boolean;
+  } | null;
 };
 
 type TenantCreateResult = TenantListItem & {
@@ -236,7 +244,94 @@ export class TenantsService {
 
     if (!tenant) throw new NotFoundException('Tenant not found');
 
-    return tenant as TenantDetail;
+    let owner: TenantDetail['owner'] = null;
+    if (tenant.ownerUserId) {
+      const ownerUser = await this.prisma.user.findFirst({
+        where: { id: tenant.ownerUserId, deletedAt: null },
+        select: {
+          id: true,
+          email: true,
+          firstName: true,
+          lastName: true,
+          emailVerified: true,
+        },
+      });
+      if (ownerUser) {
+        const membership = await this.prisma.tenantMember.findUnique({
+          where: {
+            userId_tenantId: { userId: ownerUser.id, tenantId: id },
+          },
+          select: { status: true },
+        });
+        owner = {
+          id: ownerUser.id,
+          email: ownerUser.email,
+          firstName: ownerUser.firstName,
+          lastName: ownerUser.lastName,
+          memberStatus: membership?.status ?? 'UNKNOWN',
+          emailVerified: ownerUser.emailVerified,
+        };
+      }
+    }
+
+    return { ...(tenant as Omit<TenantDetail, 'owner'>), owner };
+  }
+
+  /**
+   * Super-admin: re-send owner invite / join email (mail failure or missed inbox).
+   */
+  async resendOwnerInvite(
+    id: string,
+    actorId: string,
+  ): Promise<{
+    emailSent: boolean;
+    kind: 'invite' | 'join';
+    owner: { id: string; email: string; firstName: string; lastName: string };
+  }> {
+    const tenant = await this.assertExists(id);
+
+    if (tenant.status === TenantStatus.CANCELLED) {
+      throw new BadRequestException('Cannot resend invite for a cancelled tenant');
+    }
+    if (!tenant.ownerUserId) {
+      throw new BadRequestException('This tenant has no owner assigned');
+    }
+
+    const result = await this.usersService.resendInviteEmail(tenant.ownerUserId, id, actorId);
+
+    const ownerUser = await this.prisma.user.findFirst({
+      where: { id: tenant.ownerUserId, deletedAt: null },
+      select: { id: true, email: true, firstName: true, lastName: true },
+    });
+    if (!ownerUser) {
+      throw new NotFoundException('Owner user not found');
+    }
+
+    await this.auditLogs.write({
+      actorId,
+      tenantId: id,
+      action: 'UPDATE',
+      module: 'tenants',
+      entityId: id,
+      newValue: {
+        type: 'resend-owner-invite',
+        email: result.email,
+        kind: result.kind,
+        emailSent: result.emailSent,
+      },
+    });
+
+    if (!result.emailSent) {
+      throw new BadRequestException(
+        `Invite email could not be sent to ${result.email}. Check mail configuration and try again.`,
+      );
+    }
+
+    return {
+      emailSent: true,
+      kind: result.kind,
+      owner: ownerUser,
+    };
   }
 
   // ─── Update ──────────────────────────────────────────────────

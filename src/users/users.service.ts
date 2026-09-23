@@ -304,6 +304,83 @@ export class UsersService {
     return { ...user, emailSent };
   }
 
+  /**
+   * Re-send invite / join email for an existing membership.
+   * INVITED (or unverified) → new set-password invite link.
+   * ACTIVE → "you've been added" notification with login link.
+   */
+  async resendInviteEmail(
+    userId: string,
+    tenantId: string,
+    actorId: string,
+  ): Promise<{ emailSent: boolean; email: string; firstName: string; kind: 'invite' | 'join' }> {
+    const [user, member] = await Promise.all([
+      this.prisma.user.findFirst({
+        where: { id: userId, deletedAt: null },
+        select: { id: true, email: true, firstName: true, emailVerified: true },
+      }),
+      this.prisma.tenantMember.findUnique({
+        where: { userId_tenantId: { userId, tenantId } },
+      }),
+    ]);
+
+    if (!user) throw new NotFoundException('User not found');
+    if (!member) throw new NotFoundException('User is not a member of this workspace');
+
+    const needsInviteLink = member.status === MemberStatus.INVITED || user.emailVerified !== true;
+
+    let emailSent: boolean;
+    let kind: 'invite' | 'join';
+
+    if (needsInviteLink) {
+      // Keep / restore INVITED so they can accept the set-password flow
+      if (member.status !== MemberStatus.INVITED) {
+        await this.prisma.tenantMember.update({
+          where: { userId_tenantId: { userId, tenantId } },
+          data: { status: MemberStatus.INVITED, joinedAt: null, invitedById: actorId },
+        });
+      }
+
+      // Invalidate prior unused invite tokens for this user+tenant
+      await this.prisma.userSession.deleteMany({
+        where: {
+          userId,
+          tenantId,
+          refreshTokenHash: { startsWith: 'invite:' },
+        },
+      });
+
+      emailSent = await this.sendInviteToken(
+        user.id,
+        tenantId,
+        user.email,
+        user.firstName,
+        actorId,
+      );
+      kind = 'invite';
+    } else {
+      emailSent = await this.sendJoinWorkspaceNotification(
+        user.id,
+        tenantId,
+        user.email,
+        user.firstName,
+        actorId,
+      );
+      kind = 'join';
+    }
+
+    await this.audit.write({
+      tenantId,
+      actorId,
+      module: 'users',
+      action: 'UPDATE',
+      entityId: user.id,
+      newValue: { email: user.email, type: 'resend-invite', kind, emailSent },
+    });
+
+    return { emailSent, email: user.email, firstName: user.firstName, kind };
+  }
+
   // ─── Create ────────────────────────────────────────────────────────────
 
   async create(dto: CreateUserDto, tenantId: string, actorId: string): Promise<UserListItem> {
