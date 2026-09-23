@@ -24,7 +24,7 @@
     "prisma:migrate:prod": "prisma migrate deploy",
     "prisma:studio": "prisma studio",
     "prisma:seed": "ts-node prisma/seed.ts",
-    "prepare": "husky"
+    "prepare": "node -e \"try{require('child_process').execSync('husky',{stdio:'inherit'})}catch(e){process.exit(0)}\""
   },
   "dependencies": {
     "@nestjs-modules/mailer": "^2.3.7",

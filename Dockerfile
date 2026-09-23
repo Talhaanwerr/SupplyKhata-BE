@@ -29,8 +29,10 @@ WORKDIR /app
 RUN apk add --no-cache python3 make g++ openssl wget
 
 COPY package*.json ./
-# Do NOT use --ignore-scripts — argon2 needs its install script / native build
-RUN npm ci --omit=dev && npm cache clean --force
+# ignore-scripts: skip prepare/husky (dev-only). Then rebuild argon2 native bindings.
+RUN npm ci --omit=dev --ignore-scripts \
+  && npm rebuild argon2 \
+  && npm cache clean --force
 
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
