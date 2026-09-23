@@ -103,11 +103,17 @@ export class MailService {
     } catch (err: unknown) {
       const errMsg =
         err instanceof Error
-          ? err.message
+          ? err.message || err.name || 'Unknown error'
           : typeof err === 'object' && err !== null
             ? JSON.stringify(err)
             : String(err);
-      this.logger.error(`✗ Failed to send "${options.subject}" to ${options.to}: ${errMsg}`);
+      const code =
+        typeof err === 'object' && err !== null && 'code' in err
+          ? String((err as { code?: unknown }).code)
+          : undefined;
+      this.logger.error(
+        `✗ Failed to send "${options.subject}" to ${options.to}: ${errMsg}${code ? ` (code=${code})` : ''}`,
+      );
       if (err instanceof Error && err.stack) {
         this.logger.error(err.stack);
       }

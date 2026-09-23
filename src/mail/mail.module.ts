@@ -25,26 +25,36 @@ function resolveTemplatesDir(): string {
   imports: [
     MailerModule.forRootAsync({
       imports: [ConfigModule],
-      useFactory: (configService: ConfigService) => ({
-        transport: {
-          host: configService.getOrThrow<string>('MAIL_HOST'),
-          port: configService.getOrThrow<number>('MAIL_PORT'),
-          auth: {
-            user: configService.getOrThrow<string>('MAIL_USER'),
-            pass: configService.getOrThrow<string>('MAIL_PASS'),
+      useFactory: (configService: ConfigService) => {
+        const port = Number(configService.getOrThrow<number>('MAIL_PORT'));
+        // 465 = implicit TLS; 587 = STARTTLS (Mailtrap / most SMTP)
+        const useImplicitTls = port === 465;
+        return {
+          transport: {
+            host: configService.getOrThrow<string>('MAIL_HOST'),
+            port,
+            secure: useImplicitTls,
+            requireTLS: !useImplicitTls,
+            auth: {
+              user: configService.getOrThrow<string>('MAIL_USER'),
+              pass: configService.getOrThrow<string>('MAIL_PASS'),
+            },
+            connectionTimeout: 20_000,
+            greetingTimeout: 20_000,
+            socketTimeout: 20_000,
           },
-        },
-        defaults: {
-          from: `"${configService.getOrThrow<string>('MAIL_FROM_NAME')}" <${configService.getOrThrow<string>('MAIL_FROM')}>`,
-        },
-        template: {
-          dir: resolveTemplatesDir(),
-          adapter: new HandlebarsAdapter(),
-          options: {
-            strict: true,
+          defaults: {
+            from: `"${configService.getOrThrow<string>('MAIL_FROM_NAME')}" <${configService.getOrThrow<string>('MAIL_FROM')}>`,
           },
-        },
-      }),
+          template: {
+            dir: resolveTemplatesDir(),
+            adapter: new HandlebarsAdapter(),
+            options: {
+              strict: true,
+            },
+          },
+        };
+      },
       inject: [ConfigService],
     }),
   ],
