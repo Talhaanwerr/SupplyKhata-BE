@@ -50,6 +50,7 @@ type TenantDetail = TenantListItem & {
     lastName: string;
     memberStatus: string;
     emailVerified: boolean;
+    emailVerifiedAt: Date | null;
   } | null;
 };
 
@@ -254,6 +255,7 @@ export class TenantsService {
           firstName: true,
           lastName: true,
           emailVerified: true,
+          emailVerifiedAt: true,
         },
       });
       if (ownerUser) {
@@ -270,6 +272,7 @@ export class TenantsService {
           lastName: ownerUser.lastName,
           memberStatus: membership?.status ?? 'UNKNOWN',
           emailVerified: ownerUser.emailVerified,
+          emailVerifiedAt: ownerUser.emailVerifiedAt,
         };
       }
     }
