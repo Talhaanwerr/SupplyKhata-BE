@@ -34,6 +34,8 @@ export const envValidationSchema = Joi.object({
   MAIL_PASS: Joi.string().default(''),
   MAIL_FROM: Joi.string().default('noreply@saas.local'),
   MAIL_FROM_NAME: Joi.string().default('SaaS Platform'),
+  // Optional: Brevo HTTPS API (required on Railway Hobby — SMTP ports are blocked)
+  BREVO_API_KEY: Joi.string().allow('').optional(),
 
   // Frontend URL (for password reset / email verify links)
   FRONTEND_URL: Joi.string().uri().required(),
