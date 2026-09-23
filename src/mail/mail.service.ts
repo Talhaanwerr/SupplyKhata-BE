@@ -1,3 +1,4 @@
+import { inspect } from 'util';
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { MailerService } from '@nestjs-modules/mailer';
@@ -12,6 +13,9 @@ export class MailService {
     private readonly configService: ConfigService,
   ) {
     this.appName = this.configService.getOrThrow<string>('MAIL_FROM_NAME');
+    const host = this.configService.get<string>('MAIL_HOST');
+    const port = this.configService.get<string | number>('MAIL_PORT');
+    this.logger.log(`Mail transport configured: ${host}:${port}`);
   }
 
   async sendPasswordResetEmail(
@@ -84,6 +88,34 @@ export class MailService {
     });
   }
 
+  private formatMailError(err: unknown): string {
+    if (err == null) return 'null/undefined error';
+
+    if (err instanceof Error) {
+      const parts = [
+        err.name || 'Error',
+        err.message || '(empty message)',
+        'code' in err ? `code=${String((err as { code?: unknown }).code)}` : null,
+        'command' in err ? `command=${String((err as { command?: unknown }).command)}` : null,
+        'response' in err ? `response=${String((err as { response?: unknown }).response)}` : null,
+        'responseCode' in err
+          ? `responseCode=${String((err as { responseCode?: unknown }).responseCode)}`
+          : null,
+      ].filter(Boolean);
+      return parts.join(' | ');
+    }
+
+    if (typeof err === 'object') {
+      try {
+        return inspect(err, { depth: 4, breakLength: 120 });
+      } catch {
+        return String(err);
+      }
+    }
+
+    return String(err);
+  }
+
   private async send(options: {
     to: string;
     subject: string;
@@ -101,22 +133,9 @@ export class MailService {
       this.logger.log(`✓ Email sent "${options.subject}" → ${options.to}`);
       return true;
     } catch (err: unknown) {
-      const errMsg =
-        err instanceof Error
-          ? err.message || err.name || 'Unknown error'
-          : typeof err === 'object' && err !== null
-            ? JSON.stringify(err)
-            : String(err);
-      const code =
-        typeof err === 'object' && err !== null && 'code' in err
-          ? String((err as { code?: unknown }).code)
-          : undefined;
       this.logger.error(
-        `✗ Failed to send "${options.subject}" to ${options.to}: ${errMsg}${code ? ` (code=${code})` : ''}`,
+        `✗ Failed to send "${options.subject}" to ${options.to}: ${this.formatMailError(err)}`,
       );
-      if (err instanceof Error && err.stack) {
-        this.logger.error(err.stack);
-      }
       return false;
     }
   }
