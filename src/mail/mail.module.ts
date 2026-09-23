@@ -41,6 +41,8 @@ function resolveTemplatesDir(): string {
             port,
             secure: useImplicitTls,
             requireTLS: !useImplicitTls,
+            // Railway often has broken/unreachable IPv6 to Gmail (ENETUNREACH …::587)
+            family: 4,
             auth: { user, pass },
             connectionTimeout: 20_000,
             greetingTimeout: 20_000,
