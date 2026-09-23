@@ -51,8 +51,11 @@ const REFRESH_COOKIE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 function rtCookieOptions(isProduction: boolean) {
   return {
     httpOnly: true,
+    // Cross-origin FE (Vercel) → BE (Railway) needs SameSite=None + Secure
+    // so the browser stores/sends the cookie on credentialed fetch.
+    // Localhost same-site keeps Lax.
     secure: isProduction,
-    sameSite: 'lax' as const,
+    sameSite: (isProduction ? 'none' : 'lax') as 'none' | 'lax',
     maxAge: REFRESH_COOKIE_TTL_MS,
     path: '/api/v1/auth', // limit scope to auth endpoints only
   };
@@ -160,12 +163,7 @@ export class AuthController {
     @Res({ passthrough: true }) res: Response,
   ) {
     await this.authService.logout(user.sessionId, user.id);
-    res.clearCookie(REFRESH_COOKIE, {
-      httpOnly: true,
-      secure: this.isProduction,
-      sameSite: 'lax',
-      path: '/api/v1/auth',
-    });
+    res.clearCookie(REFRESH_COOKIE, rtCookieOptions(this.isProduction));
     return { message: 'Logged out successfully' };
   }
 
