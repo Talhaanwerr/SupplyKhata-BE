@@ -6,6 +6,7 @@ import {
   MemoryHealthIndicator,
   DiskHealthIndicator,
 } from '@nestjs/terminus';
+import { Public } from '../auth/decorators/public.decorator';
 import { PrismaHealthIndicator } from './prisma.health';
 
 @ApiTags('Health')
@@ -18,10 +19,11 @@ export class HealthController {
     private readonly disk: DiskHealthIndicator,
   ) {}
 
+  @Public()
   @Get()
   @Version('1')
   @HealthCheck()
-  @ApiOperation({ summary: 'Check application health' })
+  @ApiOperation({ summary: 'Check application health (public — used by Railway)' })
   check() {
     return this.health.check([
       () => this.prismaIndicator.isHealthy('database'),
