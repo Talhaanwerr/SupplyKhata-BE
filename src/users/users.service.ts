@@ -152,6 +152,7 @@ export class UsersService {
         lastName: true,
         email: true,
         deletedAt: true,
+        emailVerified: true,
       },
     });
 
@@ -193,7 +194,7 @@ export class UsersService {
         await this.syncRoles(existingUser.id, tenantId, dto.roleIds, actorId);
       }
 
-      const emailSent = await this.sendInviteToken(
+      const mailResult = await this.sendInviteToken(
         existingUser.id,
         tenantId,
         email,
@@ -207,11 +208,16 @@ export class UsersService {
         module: 'users',
         action: 'INVITE',
         entityId: existingUser.id,
-        newValue: { email, type: 'restored-user', emailSent },
+        newValue: {
+          email,
+          type: 'restored-user',
+          emailSent: mailResult.sent,
+          mailError: mailResult.sent ? undefined : mailResult.error,
+        },
       });
 
       const user = await this.findOne(existingUser.id, tenantId);
-      return { ...user, emailSent };
+      return { ...user, emailSent: mailResult.sent };
     }
 
     if (existingUser) {
@@ -222,7 +228,56 @@ export class UsersService {
         throw new ConflictException('This email is already a member of this workspace');
       }
 
-      // Existing active global user — enroll immediately (they already have a password)
+      // Existing user who never finished invite / set password → invite link, not join mail
+      if (!existingUser.emailVerified) {
+        await this.prisma.tenantMember.create({
+          data: {
+            userId: existingUser.id,
+            tenantId,
+            status: MemberStatus.INVITED,
+            invitedById: actorId,
+          },
+        });
+
+        if (dto.roleIds?.length) {
+          await this.syncRoles(existingUser.id, tenantId, dto.roleIds, actorId);
+        }
+
+        await this.prisma.userSession.deleteMany({
+          where: {
+            userId: existingUser.id,
+            tenantId,
+            refreshTokenHash: { startsWith: 'invite:' },
+          },
+        });
+
+        const mailResult = await this.sendInviteToken(
+          existingUser.id,
+          tenantId,
+          existingUser.email,
+          dto.firstName || existingUser.firstName,
+          actorId,
+        );
+
+        await this.audit.write({
+          tenantId,
+          actorId,
+          module: 'users',
+          action: 'INVITE',
+          entityId: existingUser.id,
+          newValue: {
+            email: existingUser.email,
+            type: 'existing-unverified',
+            emailSent: mailResult.sent,
+            mailError: mailResult.sent ? undefined : mailResult.error,
+          },
+        });
+
+        const user = await this.findOne(existingUser.id, tenantId);
+        return { ...user, emailSent: mailResult.sent };
+      }
+
+      // Existing verified user — enroll immediately (they already have a password)
       await this.prisma.tenantMember.create({
         data: {
           userId: existingUser.id,
@@ -237,7 +292,7 @@ export class UsersService {
         await this.syncRoles(existingUser.id, tenantId, dto.roleIds, actorId);
       }
 
-      const emailSent = await this.sendJoinWorkspaceNotification(
+      const mailResult = await this.sendJoinWorkspaceNotification(
         existingUser.id,
         tenantId,
         existingUser.email,
@@ -251,11 +306,16 @@ export class UsersService {
         module: 'users',
         action: 'INVITE',
         entityId: existingUser.id,
-        newValue: { email: existingUser.email, type: 'existing-user', emailSent },
+        newValue: {
+          email: existingUser.email,
+          type: 'existing-user',
+          emailSent: mailResult.sent,
+          mailError: mailResult.sent ? undefined : mailResult.error,
+        },
       });
 
       const user = await this.findOne(existingUser.id, tenantId);
-      return { ...user, emailSent };
+      return { ...user, emailSent: mailResult.sent };
     }
 
     // Brand-new user — create globally and add membership
@@ -278,7 +338,7 @@ export class UsersService {
       await this.syncRoles(newUser.id, tenantId, dto.roleIds, actorId);
     }
 
-    const emailSent = await this.sendInviteToken(
+    const mailResult = await this.sendInviteToken(
       newUser.id,
       tenantId,
       email,
@@ -296,12 +356,13 @@ export class UsersService {
         email: newUser.email,
         firstName: newUser.firstName,
         lastName: newUser.lastName,
-        emailSent,
+        emailSent: mailResult.sent,
+        mailError: mailResult.sent ? undefined : mailResult.error,
       },
     });
 
     const user = await this.findOne(newUser.id, tenantId);
-    return { ...user, emailSent };
+    return { ...user, emailSent: mailResult.sent };
   }
 
   /**
@@ -313,7 +374,13 @@ export class UsersService {
     userId: string,
     tenantId: string,
     actorId: string,
-  ): Promise<{ emailSent: boolean; email: string; firstName: string; kind: 'invite' | 'join' }> {
+  ): Promise<{
+    emailSent: boolean;
+    email: string;
+    firstName: string;
+    kind: 'invite' | 'join';
+    mailError?: string;
+  }> {
     const [user, member] = await Promise.all([
       this.prisma.user.findFirst({
         where: { id: userId, deletedAt: null },
@@ -329,11 +396,10 @@ export class UsersService {
 
     const needsInviteLink = member.status === MemberStatus.INVITED || user.emailVerified !== true;
 
-    let emailSent: boolean;
+    let mailResult: { sent: true } | { sent: false; error: string };
     let kind: 'invite' | 'join';
 
     if (needsInviteLink) {
-      // Keep / restore INVITED so they can accept the set-password flow
       if (member.status !== MemberStatus.INVITED) {
         await this.prisma.tenantMember.update({
           where: { userId_tenantId: { userId, tenantId } },
@@ -341,7 +407,6 @@ export class UsersService {
         });
       }
 
-      // Invalidate prior unused invite tokens for this user+tenant
       await this.prisma.userSession.deleteMany({
         where: {
           userId,
@@ -350,7 +415,7 @@ export class UsersService {
         },
       });
 
-      emailSent = await this.sendInviteToken(
+      mailResult = await this.sendInviteToken(
         user.id,
         tenantId,
         user.email,
@@ -359,7 +424,7 @@ export class UsersService {
       );
       kind = 'invite';
     } else {
-      emailSent = await this.sendJoinWorkspaceNotification(
+      mailResult = await this.sendJoinWorkspaceNotification(
         user.id,
         tenantId,
         user.email,
@@ -375,10 +440,22 @@ export class UsersService {
       module: 'users',
       action: 'UPDATE',
       entityId: user.id,
-      newValue: { email: user.email, type: 'resend-invite', kind, emailSent },
+      newValue: {
+        email: user.email,
+        type: 'resend-invite',
+        kind,
+        emailSent: mailResult.sent,
+        mailError: mailResult.sent ? undefined : mailResult.error,
+      },
     });
 
-    return { emailSent, email: user.email, firstName: user.firstName, kind };
+    return {
+      emailSent: mailResult.sent,
+      email: user.email,
+      firstName: user.firstName,
+      kind,
+      mailError: mailResult.sent ? undefined : mailResult.error,
+    };
   }
 
   // ─── Create ────────────────────────────────────────────────────────────
@@ -1093,7 +1170,7 @@ export class UsersService {
     email: string,
     firstName: string,
     actorId: string,
-  ): Promise<boolean> {
+  ): Promise<{ sent: true } | { sent: false; error: string }> {
     const [actor, tenant] = await Promise.all([
       this.prisma.user.findUnique({
         where: { id: actorId },
@@ -1120,17 +1197,20 @@ export class UsersService {
 
     const inviterName = actor ? `${actor.firstName} ${actor.lastName}`.trim() : 'A team admin';
 
-    const sent = await this.mail.sendInviteEmail(email, {
+    const result = await this.mail.sendInviteEmail(email, {
       firstName,
       inviterName,
       tenantName: tenant?.name ?? 'your workspace',
       inviteLink: `${this.frontendUrl}/reset-password?token=${rawToken}&invite=1`,
     });
 
-    if (!sent) {
-      this.logger.warn(`Invite email could not be sent to ${email} for tenant ${tenantId}`);
+    if (!result.sent) {
+      this.logger.warn(
+        `Invite email could not be sent to ${email} for tenant ${tenantId}: ${result.error}`,
+      );
+      return { sent: false, error: result.error };
     }
-    return sent;
+    return { sent: true };
   }
 
   private async sendJoinWorkspaceNotification(
@@ -1139,7 +1219,7 @@ export class UsersService {
     email: string,
     firstName: string,
     actorId: string,
-  ): Promise<boolean> {
+  ): Promise<{ sent: true } | { sent: false; error: string }> {
     const [actor, tenant] = await Promise.all([
       this.prisma.user.findUnique({
         where: { id: actorId },
@@ -1153,16 +1233,19 @@ export class UsersService {
 
     const inviterName = actor ? `${actor.firstName} ${actor.lastName}`.trim() : 'A team admin';
 
-    const sent = await this.mail.sendJoinWorkspaceEmail(email, {
+    const result = await this.mail.sendJoinWorkspaceEmail(email, {
       firstName,
       inviterName,
       tenantName: tenant?.name ?? 'your workspace',
       loginLink: `${this.frontendUrl}/login`,
     });
 
-    if (!sent) {
-      this.logger.warn(`Join workspace email could not be sent to ${email} for tenant ${tenantId}`);
+    if (!result.sent) {
+      this.logger.warn(
+        `Join workspace email could not be sent to ${email} for tenant ${tenantId}: ${result.error}`,
+      );
+      return { sent: false, error: result.error };
     }
-    return sent;
+    return { sent: true };
   }
 }

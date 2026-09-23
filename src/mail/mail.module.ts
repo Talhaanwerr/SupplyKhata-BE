@@ -27,24 +27,27 @@ function resolveTemplatesDir(): string {
       imports: [ConfigModule],
       useFactory: (configService: ConfigService) => {
         const port = Number(configService.getOrThrow<number>('MAIL_PORT'));
-        // 465 = implicit TLS; 587 = STARTTLS (Mailtrap / most SMTP)
+        // 465 = implicit TLS; 587 = STARTTLS (Gmail / Mailtrap)
         const useImplicitTls = port === 465;
+        const host = configService.getOrThrow<string>('MAIL_HOST').trim();
+        const user = configService.getOrThrow<string>('MAIL_USER').trim();
+        // Gmail app passwords are often pasted with spaces — strip all whitespace
+        const pass = configService.getOrThrow<string>('MAIL_PASS').replace(/\s+/g, '').trim();
+        const fromEmail = configService.getOrThrow<string>('MAIL_FROM').trim();
+        const fromName = configService.getOrThrow<string>('MAIL_FROM_NAME').trim();
         return {
           transport: {
-            host: configService.getOrThrow<string>('MAIL_HOST'),
+            host,
             port,
             secure: useImplicitTls,
             requireTLS: !useImplicitTls,
-            auth: {
-              user: configService.getOrThrow<string>('MAIL_USER'),
-              pass: configService.getOrThrow<string>('MAIL_PASS'),
-            },
+            auth: { user, pass },
             connectionTimeout: 20_000,
             greetingTimeout: 20_000,
             socketTimeout: 20_000,
           },
           defaults: {
-            from: `"${configService.getOrThrow<string>('MAIL_FROM_NAME')}" <${configService.getOrThrow<string>('MAIL_FROM')}>`,
+            from: `"${fromName}" <${fromEmail}>`,
           },
           template: {
             dir: resolveTemplatesDir(),

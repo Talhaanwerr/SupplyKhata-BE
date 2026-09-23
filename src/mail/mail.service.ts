@@ -3,6 +3,8 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { MailerService } from '@nestjs-modules/mailer';
 
+export type MailSendResult = { sent: true } | { sent: false; error: string };
+
 @Injectable()
 export class MailService {
   private readonly logger = new Logger(MailService.name);
@@ -15,13 +17,14 @@ export class MailService {
     this.appName = this.configService.getOrThrow<string>('MAIL_FROM_NAME');
     const host = this.configService.get<string>('MAIL_HOST');
     const port = this.configService.get<string | number>('MAIL_PORT');
-    this.logger.log(`Mail transport configured: ${host}:${port}`);
+    const user = this.configService.get<string>('MAIL_USER');
+    this.logger.log(`Mail transport configured: ${host}:${port} as ${user ?? '(no user)'}`);
   }
 
   async sendPasswordResetEmail(
     to: string,
     data: { firstName: string; resetLink: string },
-  ): Promise<boolean> {
+  ): Promise<MailSendResult> {
     return this.send({
       to,
       subject: 'Reset your password',
@@ -36,7 +39,7 @@ export class MailService {
   async sendVerificationEmail(
     to: string,
     data: { firstName: string; verifyLink: string },
-  ): Promise<boolean> {
+  ): Promise<MailSendResult> {
     return this.send({
       to,
       subject: 'Verify your email',
@@ -56,7 +59,7 @@ export class MailService {
       tenantName: string;
       inviteLink: string;
     },
-  ): Promise<boolean> {
+  ): Promise<MailSendResult> {
     return this.send({
       to,
       subject: `You're invited to join ${data.tenantName}`,
@@ -76,7 +79,7 @@ export class MailService {
       tenantName: string;
       loginLink: string;
     },
-  ): Promise<boolean> {
+  ): Promise<MailSendResult> {
     return this.send({
       to,
       subject: `You've been added to ${data.tenantName}`,
@@ -121,7 +124,7 @@ export class MailService {
     subject: string;
     template: string;
     context: Record<string, unknown>;
-  }): Promise<boolean> {
+  }): Promise<MailSendResult> {
     try {
       this.logger.log(`Sending "${options.subject}" to ${options.to}…`);
       await this.mailerService.sendMail({
@@ -131,12 +134,11 @@ export class MailService {
         context: options.context,
       });
       this.logger.log(`✓ Email sent "${options.subject}" → ${options.to}`);
-      return true;
+      return { sent: true };
     } catch (err: unknown) {
-      this.logger.error(
-        `✗ Failed to send "${options.subject}" to ${options.to}: ${this.formatMailError(err)}`,
-      );
-      return false;
+      const error = this.formatMailError(err);
+      this.logger.error(`✗ Failed to send "${options.subject}" to ${options.to}: ${error}`);
+      return { sent: false, error };
     }
   }
 }

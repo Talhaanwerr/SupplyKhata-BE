@@ -326,7 +326,7 @@ export class TenantsService {
 
     if (!result.emailSent) {
       throw new BadRequestException(
-        `Invite email could not be sent to ${result.email}. Check mail configuration and try again.`,
+        `Invite email could not be sent to ${result.email}. ${result.mailError ?? 'Check mail configuration and try again.'}`,
       );
     }
 
