@@ -52,4 +52,5 @@ EXPOSE 4700
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=5 \
   CMD wget -qO- "http://127.0.0.1:${PORT:-4700}/api/v1/health" || exit 1
 
-CMD ["node", "dist/src/main"]
+# Apply pending migrations, then start API
+CMD ["sh", "-c", "npx prisma migrate deploy && node dist/src/main"]
