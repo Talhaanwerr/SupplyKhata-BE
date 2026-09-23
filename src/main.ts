@@ -126,12 +126,16 @@ async function bootstrap(): Promise<void> {
     });
   }
 
-  await app.listen(port);
+  // Bind 0.0.0.0 so Railway/Docker proxies can reach the process
+  await app.listen(port, '0.0.0.0');
 
-  console.log(`Application running on: http://localhost:${port}/api/v1`);
+  console.log(`Application running on: http://0.0.0.0:${port}/api/v1`);
   if (swaggerEnabled && !isProduction) {
     console.log(`Swagger docs: http://localhost:${port}/api/docs`);
   }
 }
 
-bootstrap();
+bootstrap().catch((err: unknown) => {
+  console.error('Fatal bootstrap error:', err);
+  process.exit(1);
+});
