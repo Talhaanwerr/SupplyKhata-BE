@@ -11,6 +11,8 @@ import { MailService } from '../mail/mail.service';
 
 const mockPrisma = {
   user: { findFirst: jest.fn(), findUnique: jest.fn(), update: jest.fn() },
+  tenant: { findFirst: jest.fn() },
+  tenantMember: { findMany: jest.fn(), findUnique: jest.fn(), findFirst: jest.fn() },
   userSession: {
     create: jest.fn(),
     update: jest.fn(),
@@ -32,6 +34,7 @@ const mockConfig = {
       API_PUBLIC_URL: 'http://localhost:4700',
       JWT_REFRESH_EXPIRES_IN: '7d',
       JWT_REFRESH_SECRET: 'refresh-secret',
+      JWT_SECRET: 'access-secret',
     };
     return map[key];
   }),
@@ -72,26 +75,30 @@ describe('AuthService', () => {
     const activeUser = {
       id: 'user-1',
       email: dto.email,
-      tenantId: 'tenant-1',
       passwordHash: 'hashed',
-      status: 'ACTIVE',
       emailVerified: true,
       isSuperAdmin: false,
       firstName: 'Alice',
       lastName: 'Smith',
+      totpEnabled: false,
+    };
+
+    const membership = {
+      tenantId: 'tenant-1',
+      tenant: { id: 'tenant-1', name: 'Acme', slug: 'acme', logo: null },
     };
 
     beforeEach(() => {
-      // No lockout by default
       mockPrisma.loginAttempt.count.mockResolvedValue(0);
       mockPrisma.loginAttempt.create.mockResolvedValue({});
       mockPrisma.userSession.create.mockResolvedValue({ id: 'session-1' });
+      mockPrisma.userSession.update.mockResolvedValue({});
+      mockPrisma.tenantMember.findMany.mockResolvedValue([membership]);
+      jest.spyOn(argon2, 'hash').mockResolvedValue('hashed-rt');
     });
 
     it('returns tokens for valid credentials', async () => {
-      mockPrisma.user.findFirst.mockResolvedValue(activeUser);
-
-      // Patch argon2.verify via module internals — use a spy on the hash comparison
+      mockPrisma.user.findUnique.mockResolvedValue(activeUser);
       jest.spyOn(argon2, 'verify').mockResolvedValue(true);
 
       const result = await service.login(dto);
@@ -104,35 +111,37 @@ describe('AuthService', () => {
     });
 
     it('throws UnauthorizedException for wrong password', async () => {
-      mockPrisma.user.findFirst.mockResolvedValue(activeUser);
+      mockPrisma.user.findUnique.mockResolvedValue(activeUser);
       jest.spyOn(argon2, 'verify').mockResolvedValue(false);
 
       await expect(service.login(dto)).rejects.toThrow(UnauthorizedException);
     });
 
     it('throws UnauthorizedException when user does not exist', async () => {
-      mockPrisma.user.findFirst.mockResolvedValue(null);
+      mockPrisma.user.findUnique.mockResolvedValue(null);
       jest.spyOn(argon2, 'verify').mockResolvedValue(false);
 
       await expect(service.login(dto)).rejects.toThrow(UnauthorizedException);
     });
 
-    it('throws ForbiddenException when account is suspended', async () => {
-      mockPrisma.user.findFirst.mockResolvedValue({ ...activeUser, status: 'SUSPENDED' });
+    it('throws UnauthorizedException when user has no active workspace', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(activeUser);
+      mockPrisma.tenantMember.findMany.mockResolvedValue([]);
+      mockPrisma.tenantMember.findFirst.mockResolvedValue(null);
       jest.spyOn(argon2, 'verify').mockResolvedValue(true);
 
-      await expect(service.login(dto)).rejects.toThrow(ForbiddenException);
+      await expect(service.login(dto)).rejects.toThrow(UnauthorizedException);
     });
 
     it('throws ForbiddenException when email not verified', async () => {
-      mockPrisma.user.findFirst.mockResolvedValue({ ...activeUser, emailVerified: false });
+      mockPrisma.user.findUnique.mockResolvedValue({ ...activeUser, emailVerified: false });
       jest.spyOn(argon2, 'verify').mockResolvedValue(true);
 
       await expect(service.login(dto)).rejects.toThrow(ForbiddenException);
     });
 
     it('throws ForbiddenException when account is locked', async () => {
-      mockPrisma.loginAttempt.count.mockResolvedValue(5); // maxAttempts reached
+      mockPrisma.loginAttempt.count.mockResolvedValue(5);
 
       await expect(service.login(dto)).rejects.toThrow(ForbiddenException);
     });
@@ -154,6 +163,7 @@ describe('AuthService', () => {
       const session = {
         id: 'session-1',
         userId: 'user-1',
+        tenantId: 'tenant-1',
         refreshTokenHash: 'hashed-rt',
         expiresAt: new Date(Date.now() + 60000),
       };
@@ -161,12 +171,12 @@ describe('AuthService', () => {
       mockPrisma.userSession.findFirst.mockResolvedValue(session);
       mockPrisma.userSession.delete.mockResolvedValue(session);
       mockPrisma.userSession.create.mockResolvedValue({ id: 'session-2' });
+      mockPrisma.userSession.update.mockResolvedValue({});
+      mockPrisma.tenant.findFirst.mockResolvedValue({ status: 'ACTIVE', deletedAt: null });
       mockPrisma.user.findUnique.mockResolvedValue({
         id: 'user-1',
         email: 'alice@acme.com',
-        tenantId: 'tenant-1',
         isSuperAdmin: false,
-        status: 'ACTIVE',
       });
 
       jest.spyOn(argon2, 'verify').mockResolvedValue(true);
@@ -179,25 +189,27 @@ describe('AuthService', () => {
     it('throws UnauthorizedException for expired session', async () => {
       mockPrisma.userSession.findFirst.mockResolvedValue({
         id: 'session-1',
-        expiresAt: new Date(Date.now() - 1000), // expired
+        expiresAt: new Date(Date.now() - 1000),
       });
 
       await expect(service.refreshTokens(userWithToken)).rejects.toThrow(UnauthorizedException);
     });
 
-    it('throws UnauthorizedException and clears all sessions on token mismatch', async () => {
+    it('throws UnauthorizedException and clears only the mismatched session', async () => {
       mockPrisma.userSession.findFirst.mockResolvedValue({
         id: 'session-1',
+        tenantId: 'tenant-1',
         refreshTokenHash: 'hashed-rt',
         expiresAt: new Date(Date.now() + 60000),
       });
+      mockPrisma.tenant.findFirst.mockResolvedValue({ status: 'ACTIVE', deletedAt: null });
       mockPrisma.userSession.deleteMany.mockResolvedValue({ count: 1 });
 
       jest.spyOn(argon2, 'verify').mockResolvedValue(false);
 
       await expect(service.refreshTokens(userWithToken)).rejects.toThrow(UnauthorizedException);
       expect(mockPrisma.userSession.deleteMany).toHaveBeenCalledWith({
-        where: { userId: 'user-1' },
+        where: { id: 'session-1' },
       });
     });
   });

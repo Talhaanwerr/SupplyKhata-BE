@@ -12,24 +12,39 @@ const ACTOR_ID = 'admin-1';
 
 const baseUser = {
   id: 'user-1',
-  tenantId: TENANT_ID,
   email: 'alice@acme.com',
   firstName: 'Alice',
   lastName: 'Smith',
-  status: 'ACTIVE',
   emailVerified: true,
+  emailVerifiedAt: new Date(),
   avatarUrl: null,
   timezone: null,
   isSuperAdmin: false,
-  invitedById: null,
   createdAt: new Date(),
   updatedAt: new Date(),
   deletedAt: null,
 };
 
+const activeMember = {
+  userId: 'user-1',
+  tenantId: TENANT_ID,
+  status: 'ACTIVE',
+  invitedById: null,
+  createdAt: new Date(),
+  updatedAt: new Date(),
+  user: baseUser,
+};
+
 const mockPrisma = {
   user: {
     findFirst: jest.fn(),
+    findUnique: jest.fn(),
+    create: jest.fn(),
+    update: jest.fn(),
+    findMany: jest.fn(),
+    count: jest.fn(),
+  },
+  tenantMember: {
     findUnique: jest.fn(),
     create: jest.fn(),
     update: jest.fn(),
@@ -76,8 +91,11 @@ describe('UsersService', () => {
 
   describe('create', () => {
     it('creates a user successfully', async () => {
-      mockPrisma.user.findFirst.mockResolvedValueOnce(null); // email unique check
+      mockPrisma.user.findUnique.mockResolvedValueOnce(null);
       mockPrisma.user.create.mockResolvedValue(baseUser);
+      mockPrisma.tenantMember.create.mockResolvedValue(activeMember);
+      mockPrisma.tenantMember.findUnique.mockResolvedValue(activeMember);
+      mockPrisma.userRole.findMany.mockResolvedValue([]);
       jest.spyOn(argon2, 'hash').mockResolvedValue('hashed');
 
       const result = await service.create(
@@ -90,8 +108,9 @@ describe('UsersService', () => {
       expect(mockAudit.write).toHaveBeenCalled();
     });
 
-    it('throws ConflictException when email already exists', async () => {
-      mockPrisma.user.findFirst.mockResolvedValueOnce(baseUser); // email taken
+    it('throws ConflictException when email already exists in workspace', async () => {
+      mockPrisma.user.findUnique.mockResolvedValueOnce({ id: baseUser.id, deletedAt: null });
+      mockPrisma.tenantMember.findUnique.mockResolvedValueOnce(activeMember);
 
       await expect(
         service.create(
@@ -107,28 +126,23 @@ describe('UsersService', () => {
 
   describe('findOne', () => {
     it('returns user with roles', async () => {
-      const userWithRoles = {
-        ...baseUser,
-        emailVerifiedAt: null,
-        roles: [
-          {
-            id: 'ur-1',
-            tenantId: TENANT_ID,
-            createdAt: new Date(),
-            role: { id: 'r1', name: 'Viewer', slug: 'viewer', isSystem: true },
-          },
-        ],
-      };
-      mockPrisma.user.findFirst.mockResolvedValue(userWithRoles);
+      mockPrisma.tenantMember.findUnique.mockResolvedValue(activeMember);
+      mockPrisma.userRole.findMany.mockResolvedValue([
+        {
+          id: 'ur-1',
+          createdAt: new Date(),
+          role: { id: 'r1', name: 'Viewer', slug: 'viewer', isSystem: true },
+        },
+      ]);
 
       const result = await service.findOne('user-1', TENANT_ID);
       expect(result.email).toBe('alice@acme.com');
       expect(result.roles).toHaveLength(1);
-      expect((result.roles[0] as unknown as { slug: string }).slug).toBe('viewer');
+      expect(result.roles[0].slug).toBe('viewer');
     });
 
     it('throws NotFoundException when user not in tenant', async () => {
-      mockPrisma.user.findFirst.mockResolvedValue(null);
+      mockPrisma.tenantMember.findUnique.mockResolvedValue(null);
       await expect(service.findOne('user-1', TENANT_ID)).rejects.toThrow(NotFoundException);
     });
   });
@@ -137,20 +151,27 @@ describe('UsersService', () => {
 
   describe('deactivate', () => {
     it('deactivates an active user and invalidates sessions', async () => {
-      mockPrisma.user.findFirst.mockResolvedValue(baseUser);
-      mockPrisma.user.update.mockResolvedValue({ ...baseUser, status: 'INACTIVE' });
+      mockPrisma.tenantMember.findUnique
+        .mockResolvedValueOnce(activeMember)
+        .mockResolvedValueOnce({ ...activeMember, status: 'INACTIVE' });
+      mockPrisma.tenantMember.update.mockResolvedValue({ ...activeMember, status: 'INACTIVE' });
       mockPrisma.userSession.deleteMany.mockResolvedValue({ count: 1 });
+      mockPrisma.userRole.findMany.mockResolvedValue([]);
 
       await service.deactivate('user-1', TENANT_ID, ACTOR_ID);
 
       expect(mockPrisma.userSession.deleteMany).toHaveBeenCalledWith({
-        where: { userId: 'user-1' },
+        where: { userId: 'user-1', tenantId: TENANT_ID },
       });
       expect(mockAudit.write).toHaveBeenCalled();
     });
 
     it('throws BadRequestException when user tries to deactivate themselves', async () => {
-      mockPrisma.user.findFirst.mockResolvedValue({ ...baseUser, id: ACTOR_ID });
+      mockPrisma.tenantMember.findUnique.mockResolvedValue({
+        ...activeMember,
+        userId: ACTOR_ID,
+        user: { ...baseUser, id: ACTOR_ID },
+      });
 
       await expect(service.deactivate(ACTOR_ID, TENANT_ID, ACTOR_ID)).rejects.toThrow(
         BadRequestException,
@@ -158,8 +179,7 @@ describe('UsersService', () => {
     });
 
     it('throws NotFoundException for user from another tenant', async () => {
-      // findFirst returns null because tenantId filter won't match
-      mockPrisma.user.findFirst.mockResolvedValue(null);
+      mockPrisma.tenantMember.findUnique.mockResolvedValue(null);
 
       await expect(service.deactivate('user-x', 'other-tenant', ACTOR_ID)).rejects.toThrow(
         NotFoundException,
@@ -171,7 +191,7 @@ describe('UsersService', () => {
 
   describe('cross-tenant isolation', () => {
     it('cannot find users from another tenant', async () => {
-      mockPrisma.user.findFirst.mockResolvedValue(null);
+      mockPrisma.tenantMember.findUnique.mockResolvedValue(null);
 
       await expect(service.findOne('user-1', 'wrong-tenant')).rejects.toThrow(NotFoundException);
     });
