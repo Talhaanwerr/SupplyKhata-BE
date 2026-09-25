@@ -13,6 +13,7 @@ import {
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { DeliveryRunStockDto } from './delivery-run-stock.dto';
+import { DeliveryRunRefillLoadDto } from './delivery-run-refill-load.dto';
 
 export class CreateDeliveryRunDto {
   @ApiProperty()
@@ -40,6 +41,14 @@ export class CreateDeliveryRunDto {
   @ValidateNested({ each: true })
   @Type(() => DeliveryRunStockDto)
   openingStock!: DeliveryRunStockDto[];
+
+  @ApiPropertyOptional({ type: [DeliveryRunRefillLoadDto] })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(100)
+  @ValidateNested({ each: true })
+  @Type(() => DeliveryRunRefillLoadDto)
+  refillLoads?: DeliveryRunRefillLoadDto[];
 
   @ApiPropertyOptional()
   @IsOptional()

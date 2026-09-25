@@ -14,6 +14,10 @@ import { CreatePaymentDto } from './dto/create-payment.dto';
 import { UpdatePaymentDto } from './dto/update-payment.dto';
 import { ListPaymentsQueryDto } from './dto/list-payments-query.dto';
 import { lastDueDate, nextDueDate, sameCalendarDay, startOfDay } from './billing-due.helpers';
+import {
+  clearFulfilledPromisesForTenant,
+  clearPromisedDueIfSettled,
+} from '../common/helpers/promised-due.helper';
 
 type DecimalLike = Prisma.Decimal | number | null | undefined;
 
@@ -138,21 +142,7 @@ export class PaymentsService {
         },
       });
 
-      const balanceAgg = await tx.customerLedgerEntry.aggregate({
-        where: { tenantId, customerId: dto.customerId },
-        _sum: { amount: true },
-      });
-      const balanceAfter = decimalToNumber(balanceAgg._sum.amount);
-      if (balanceAfter <= 0.00001) {
-        await tx.customer.update({
-          where: { id: dto.customerId },
-          data: {
-            promisedDueDate: null,
-            promisedDueAmount: null,
-            promisedDueDeliveryId: null,
-          },
-        });
-      }
+      await clearPromisedDueIfSettled(tx, tenantId, dto.customerId);
 
       return tx.payment.findFirstOrThrow({
         where: { id: created.id, tenantId },
@@ -243,6 +233,8 @@ export class PaymentsService {
           ...(dto.notes !== undefined ? { notes: nextNotes?.trim() || 'Standalone payment' } : {}),
         },
       });
+
+      await clearPromisedDueIfSettled(tx, tenantId, existing.customerId);
 
       return tx.payment.findFirstOrThrow({
         where: { id, tenantId },
@@ -362,6 +354,9 @@ export class PaymentsService {
   async dashboard(tenantId: string) {
     const now = new Date();
     const today = startOfDay(now);
+
+    // Heal stale promises (e.g. paid promised amount but balance still open).
+    await clearFulfilledPromisesForTenant(this.prisma, tenantId);
 
     const customers = await this.prisma.customer.findMany({
       where: { tenantId, deletedAt: null, status: 'ACTIVE' },

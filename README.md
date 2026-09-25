@@ -363,8 +363,9 @@ git pull origin main
 # 2. Build new image
 docker build -t saas-api:latest .
 
-# 3. Run DB migrations (zero-downtime — migrate deploy is safe to run on live DB)
+# 3. Run DB migrations + seed (container start also runs migrate+seed automatically)
 docker run --rm --env-file .env saas-api:latest npx prisma migrate deploy
+docker run --rm --env-file .env saas-api:latest node dist/prisma/seed.js
 
 # 4. Swap container (no downtime if behind a load balancer / Nginx)
 docker compose down api
@@ -376,7 +377,8 @@ docker compose up -d api
 Seeds are for initial setup and should be run from your **local machine** pointing to the production database:
 
 ```bash
-# Set DATABASE_URL in your local .env to the production DB
+# Seed is idempotent (upserts). Production container start runs seed automatically after migrate.
+# Manual seed against prod DB if needed:
 DATABASE_URL="mysql://user:pass@prod-host:3306/saas_db" npm run prisma:seed
 ```
 

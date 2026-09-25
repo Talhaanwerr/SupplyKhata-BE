@@ -10,7 +10,15 @@ import { UpdateCustomerDto } from './dto/update-customer.dto';
 import { ListCustomersQueryDto } from './dto/list-customers-query.dto';
 import { ListCustomerLedgerQueryDto } from './dto/list-customer-ledger-query.dto';
 import { CustomerStatementQueryDto } from './dto/customer-statement-query.dto';
-import { LedgerEntryType } from '../common/enums/delivery.enum';
+import { LedgerEntryType, ContainerMovementType } from '../common/enums/delivery.enum';
+import { customerContainerSignedQty } from '../common/helpers/container-balance.helper';
+import { clearPromisedDueIfSettled } from '../common/helpers/promised-due.helper';
+import {
+  assertReturnableContainersEnabled,
+  isReturnableContainersEnabled,
+} from '../common/helpers/returnable-containers.helper';
+import { AdjustCustomerContainersDto } from './dto/adjust-customer-containers.dto';
+import { OpeningContainerInputDto } from './dto/create-customer.dto';
 
 type DecimalLike = Prisma.Decimal | number | null | undefined;
 
@@ -157,6 +165,7 @@ export class CustomersService {
   }
 
   async findOne(id: string, tenantId: string) {
+    await clearPromisedDueIfSettled(this.prisma, tenantId, id);
     const customer = await this.findActiveOrThrow(id, tenantId);
     return this.toDetail(customer);
   }
@@ -176,6 +185,10 @@ export class CustomersService {
 
       if (dto.customerProductPrices?.length) {
         await this.assertProductsBelongToTenant(tx, tenantId, dto.customerProductPrices);
+      }
+      if (dto.openingContainers?.length) {
+        await assertReturnableContainersEnabled(tx, tenantId);
+        await this.assertOpeningContainers(tx, tenantId, dto.openingContainers);
       }
 
       const created = await tx.customer.create({
@@ -221,6 +234,22 @@ export class CustomersService {
             notes: 'Opening receivable balance',
           },
         });
+      }
+
+      if (dto.openingContainers?.length) {
+        for (const row of dto.openingContainers) {
+          if (row.quantity <= 0) continue;
+          await tx.containerMovement.create({
+            data: {
+              tenantId,
+              productId: row.productId,
+              customerId: created.id,
+              quantity: row.quantity,
+              movementType: ContainerMovementType.OPENING_WITH_CUSTOMER,
+              notes: 'Opening balance on customer create',
+            },
+          });
+        }
       }
 
       return created as unknown as CustomerDetailRow;
@@ -373,6 +402,90 @@ export class CustomersService {
     });
 
     return this.toDetail(updated);
+  }
+
+  async containerBalance(id: string, tenantId: string) {
+    await this.findActiveOrThrow(id, tenantId);
+
+    if (!(await isReturnableContainersEnabled(this.prisma, tenantId))) {
+      return [];
+    }
+
+    const products = await this.prisma.product.findMany({
+      where: { tenantId, deletedAt: null, isReturnable: true },
+      select: { id: true, name: true },
+      orderBy: { name: 'asc' },
+    });
+
+    const movements = await this.prisma.containerMovement.findMany({
+      where: {
+        tenantId,
+        customerId: id,
+        productId: { in: products.map((p) => p.id) },
+      },
+      select: { productId: true, movementType: true, quantity: true },
+    });
+
+    const balanceByProduct = new Map<string, { balance: number; movementsCount: number }>();
+    for (const m of movements) {
+      const prev = balanceByProduct.get(m.productId) ?? { balance: 0, movementsCount: 0 };
+      prev.balance += customerContainerSignedQty(m.movementType, m.quantity);
+      prev.movementsCount += 1;
+      balanceByProduct.set(m.productId, prev);
+    }
+
+    return products.map((product) => {
+      const row = balanceByProduct.get(product.id);
+      return {
+        productId: product.id,
+        productName: product.name,
+        balance: row?.balance ?? 0,
+        movementsCount: row?.movementsCount ?? 0,
+      };
+    });
+  }
+
+  async adjustContainers(
+    id: string,
+    tenantId: string,
+    dto: AdjustCustomerContainersDto,
+    actorId: string,
+  ) {
+    if (dto.quantityDelta === 0) {
+      throw new BadRequestException('quantityDelta must be non-zero');
+    }
+
+    await assertReturnableContainersEnabled(this.prisma, tenantId);
+    await this.findActiveOrThrow(id, tenantId);
+    await this.assertReturnableProduct(this.prisma, tenantId, dto.productId);
+
+    const movement = await this.prisma.containerMovement.create({
+      data: {
+        tenantId,
+        productId: dto.productId,
+        customerId: id,
+        quantity: dto.quantityDelta,
+        movementType: ContainerMovementType.ADJUSTMENT,
+        notes: dto.notes?.trim() || 'Customer container adjustment',
+      },
+    });
+
+    await this.audit.write({
+      tenantId,
+      actorId,
+      module: 'customers',
+      action: 'UPDATE',
+      entityId: id,
+      newValue: {
+        containerAdjustment: {
+          productId: dto.productId,
+          quantityDelta: dto.quantityDelta,
+          movementId: movement.id,
+        },
+      },
+    });
+
+    return this.containerBalance(id, tenantId);
   }
 
   async softDelete(id: string, tenantId: string, actorId: string): Promise<void> {
@@ -685,6 +798,54 @@ export class CustomersService {
     });
     if (count !== ids.length) {
       throw new BadRequestException('One or more products are invalid for this workspace');
+    }
+  }
+
+  private async assertOpeningContainers(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    rows: OpeningContainerInputDto[],
+  ): Promise<void> {
+    const ids = rows.map((row) => row.productId);
+    if (new Set(ids).size !== ids.length) {
+      throw new BadRequestException('Each product can appear only once in openingContainers');
+    }
+    const products = await tx.product.findMany({
+      where: {
+        tenantId,
+        deletedAt: null,
+        isActive: true,
+        isReturnable: true,
+        id: { in: ids },
+      },
+      select: { id: true },
+    });
+    if (products.length !== ids.length) {
+      throw new BadRequestException(
+        'openingContainers must use active returnable products in this workspace',
+      );
+    }
+  }
+
+  private async assertReturnableProduct(
+    db: PrismaService | Prisma.TransactionClient,
+    tenantId: string,
+    productId: string,
+  ): Promise<void> {
+    const product = await db.product.findFirst({
+      where: {
+        id: productId,
+        tenantId,
+        deletedAt: null,
+        isActive: true,
+        isReturnable: true,
+      },
+      select: { id: true },
+    });
+    if (!product) {
+      throw new BadRequestException(
+        'Product must be an active returnable product in this workspace',
+      );
     }
   }
 

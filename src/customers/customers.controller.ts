@@ -25,6 +25,7 @@ import { ListCustomersQueryDto } from './dto/list-customers-query.dto';
 import { ResolveCustomerPriceQueryDto } from './dto/resolve-price-query.dto';
 import { ListCustomerLedgerQueryDto } from './dto/list-customer-ledger-query.dto';
 import { CustomerStatementQueryDto } from './dto/customer-statement-query.dto';
+import { AdjustCustomerContainersDto } from './dto/adjust-customer-containers.dto';
 
 @UseGuards(JwtAuthGuard, TenantGuard, PermissionsGuard)
 @Controller({ path: 'customers', version: '1' })
@@ -71,6 +72,23 @@ export class CustomersController {
     @CurrentTenant() tenantId: string,
   ) {
     return this.customersService.statement(id, tenantId, query);
+  }
+
+  @Get(':id/container-balance')
+  @RequirePermissions('customers:read')
+  containerBalance(@Param('id') id: string, @CurrentTenant() tenantId: string) {
+    return this.customersService.containerBalance(id, tenantId);
+  }
+
+  @Post(':id/container-adjustments')
+  @RequirePermissions('customers:update')
+  adjustContainers(
+    @Param('id') id: string,
+    @Body() dto: AdjustCustomerContainersDto,
+    @CurrentTenant() tenantId: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.customersService.adjustContainers(id, tenantId, dto, user.id);
   }
 
   @Get(':id/price')

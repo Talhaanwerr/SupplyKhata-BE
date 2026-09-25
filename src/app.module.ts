@@ -22,6 +22,13 @@ import { VehiclesModule } from './vehicles/vehicles.module';
 import { DeliveryRunsModule } from './delivery-runs/delivery-runs.module';
 import { DeliveriesModule } from './deliveries/deliveries.module';
 import { PaymentsModule } from './payments/payments.module';
+import { RefillBatchesModule } from './refill-batches/refill-batches.module';
+import { ExpensesModule } from './expenses/expenses.module';
+import { CashHandoversModule } from './cash-handovers/cash-handovers.module';
+import { ContainerInventoryModule } from './container-inventory/container-inventory.module';
+import { DashboardModule } from './dashboard/dashboard.module';
+import { ReportsModule } from './reports/reports.module';
+import { CollectionsModule } from './collections/collections.module';
 import { envValidationSchema } from './config/env.validation';
 import { winstonConfig } from './config/logger.config';
 
@@ -66,6 +73,13 @@ import { winstonConfig } from './config/logger.config';
     DeliveryRunsModule,
     DeliveriesModule,
     PaymentsModule,
+    RefillBatchesModule,
+    ExpensesModule,
+    CashHandoversModule,
+    ContainerInventoryModule,
+    DashboardModule,
+    ReportsModule,
+    CollectionsModule,
   ],
 })
 export class AppModule {}

@@ -31,6 +31,8 @@ export enum ContainerMovementType {
   LOST = 'LOST',
   DAMAGED = 'DAMAGED',
   ADJUSTMENT = 'ADJUSTMENT',
+  OPENING_WITH_CUSTOMER = 'OPENING_WITH_CUSTOMER',
+  OPENING_ON_HAND = 'OPENING_ON_HAND',
 }
 
 export enum LedgerEntryType {

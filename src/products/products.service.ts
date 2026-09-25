@@ -4,9 +4,11 @@ import {
   ConflictException,
   BadRequestException,
 } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { Prisma, ProductBaseUnit as PrismaProductBaseUnit } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditLogsService } from '../audit-logs/audit-logs.service';
+import { ProductBaseUnit } from '../common/enums/product.enum';
+import { normalizePackFields } from '../common/helpers/product-qty.helper';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { ListProductsQueryDto } from './dto/list-products-query.dto';
@@ -53,6 +55,19 @@ function formatCalendarDateUtc(date: Date): string {
   return `${y}-${m}-${d}`;
 }
 
+function defaultUnitLabel(baseUnit: ProductBaseUnit | PrismaProductBaseUnit): string {
+  switch (baseUnit) {
+    case ProductBaseUnit.LTR:
+    case 'LTR':
+      return 'L';
+    case ProductBaseUnit.KG:
+    case 'KG':
+      return 'kg';
+    default:
+      return 'pcs';
+  }
+}
+
 export type ProductCostItem = {
   id: string;
   tenantId: string;
@@ -75,6 +90,12 @@ export type ProductItem = {
   isReturnable: boolean;
   containerType: string | null;
   defaultSellingPrice: number;
+  baseUnit: ProductBaseUnit;
+  unitsPerPack: number | null;
+  packLabel: string | null;
+  containerCapacity: number | null;
+  allowFractionalQty: boolean;
+  hasPackHelper: boolean;
   createdAt: Date;
   updatedAt: Date;
   currentCost: number | null;
@@ -131,14 +152,27 @@ export class ProductsService {
 
     await this.assertNameUnique(tenantId, name);
 
+    const pack = normalizePackFields({
+      unitsPerPack: dto.unitsPerPack,
+      packLabel: dto.packLabel,
+    });
+    const allowFractionalQty =
+      dto.allowFractionalQty ??
+      (dto.baseUnit === ProductBaseUnit.LTR || dto.baseUnit === ProductBaseUnit.KG);
+
     const product = await this.prisma.product.create({
       data: {
         tenantId,
         name,
         volume: dto.volume ?? null,
-        unit: dto.unit?.trim() || 'L',
+        unit: dto.unit?.trim() || defaultUnitLabel(dto.baseUnit),
         sku: dto.sku?.trim() || null,
         defaultSellingPrice: dto.defaultSellingPrice,
+        baseUnit: dto.baseUnit as PrismaProductBaseUnit,
+        unitsPerPack: pack.unitsPerPack,
+        packLabel: pack.packLabel,
+        containerCapacity: dto.containerCapacity ?? null,
+        allowFractionalQty,
         isReturnable: dto.isReturnable ?? true,
         containerType: dto.containerType?.trim() || null,
         isActive: dto.isActive ?? true,
@@ -164,7 +198,11 @@ export class ProductsService {
           module: 'products',
           action: 'CREATE',
           entityId: product.id,
-          newValue: { name: product.name, defaultSellingPrice: dto.defaultSellingPrice },
+          newValue: {
+            name: product.name,
+            baseUnit: dto.baseUnit,
+            defaultSellingPrice: dto.defaultSellingPrice,
+          },
         }),
       ]);
       currentCost = Number(cost.costPerUnit.toString());
@@ -175,7 +213,11 @@ export class ProductsService {
         module: 'products',
         action: 'CREATE',
         entityId: product.id,
-        newValue: { name: product.name, defaultSellingPrice: dto.defaultSellingPrice },
+        newValue: {
+          name: product.name,
+          baseUnit: dto.baseUnit,
+          defaultSellingPrice: dto.defaultSellingPrice,
+        },
       });
     }
 
@@ -196,16 +238,42 @@ export class ProductsService {
       await this.assertNameUnique(tenantId, name, id);
     }
 
+    const packTouched = dto.unitsPerPack !== undefined || dto.packLabel !== undefined;
+    const pack = packTouched
+      ? normalizePackFields({
+          unitsPerPack: dto.unitsPerPack !== undefined ? dto.unitsPerPack : existing.unitsPerPack,
+          packLabel: dto.packLabel !== undefined ? dto.packLabel : existing.packLabel,
+        })
+      : null;
+
+    const nextBaseUnit = (dto.baseUnit ?? existing.baseUnit) as ProductBaseUnit;
+    const allowFractionalQty =
+      dto.allowFractionalQty !== undefined
+        ? dto.allowFractionalQty
+        : dto.baseUnit !== undefined
+          ? nextBaseUnit === ProductBaseUnit.LTR || nextBaseUnit === ProductBaseUnit.KG
+          : undefined;
+
     const updated = await this.prisma.product.update({
       where: { id },
       data: {
         ...(dto.name !== undefined ? { name: dto.name.trim() } : {}),
         ...(dto.volume !== undefined ? { volume: dto.volume } : {}),
-        ...(dto.unit !== undefined ? { unit: dto.unit?.trim() || null } : {}),
+        ...(dto.unit !== undefined
+          ? { unit: dto.unit?.trim() || null }
+          : dto.baseUnit !== undefined
+            ? { unit: defaultUnitLabel(dto.baseUnit) }
+            : {}),
         ...(dto.sku !== undefined ? { sku: dto.sku?.trim() || null } : {}),
         ...(dto.defaultSellingPrice !== undefined
           ? { defaultSellingPrice: dto.defaultSellingPrice }
           : {}),
+        ...(dto.baseUnit !== undefined ? { baseUnit: dto.baseUnit as PrismaProductBaseUnit } : {}),
+        ...(pack ? { unitsPerPack: pack.unitsPerPack, packLabel: pack.packLabel } : {}),
+        ...(dto.containerCapacity !== undefined
+          ? { containerCapacity: dto.containerCapacity }
+          : {}),
+        ...(allowFractionalQty !== undefined ? { allowFractionalQty } : {}),
         ...(dto.isReturnable !== undefined ? { isReturnable: dto.isReturnable } : {}),
         ...(dto.containerType !== undefined
           ? { containerType: dto.containerType?.trim() || null }
@@ -223,6 +291,7 @@ export class ProductsService {
         entityId: id,
         oldValue: {
           name: existing.name,
+          baseUnit: existing.baseUnit,
           defaultSellingPrice: decimalToNumber(existing.defaultSellingPrice),
           isActive: existing.isActive,
         },
@@ -415,6 +484,11 @@ export class ProductsService {
       isReturnable: boolean;
       containerType: string | null;
       defaultSellingPrice: Prisma.Decimal;
+      baseUnit: PrismaProductBaseUnit;
+      unitsPerPack: number | null;
+      packLabel: string | null;
+      containerCapacity: Prisma.Decimal | null;
+      allowFractionalQty: boolean;
       createdAt: Date;
       updatedAt: Date;
     },
@@ -431,6 +505,12 @@ export class ProductsService {
       isReturnable: product.isReturnable,
       containerType: product.containerType,
       defaultSellingPrice: Number(product.defaultSellingPrice.toString()),
+      baseUnit: product.baseUnit as ProductBaseUnit,
+      unitsPerPack: product.unitsPerPack,
+      packLabel: product.packLabel,
+      containerCapacity: decimalToNumber(product.containerCapacity),
+      allowFractionalQty: product.allowFractionalQty,
+      hasPackHelper: product.unitsPerPack != null && product.unitsPerPack > 0,
       createdAt: product.createdAt,
       updatedAt: product.updatedAt,
       currentCost,

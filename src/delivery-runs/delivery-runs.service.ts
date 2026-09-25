@@ -15,6 +15,8 @@ import { CloseDeliveryRunDto } from './dto/close-delivery-run.dto';
 import { UpdateDeliveryRunDto } from './dto/update-delivery-run.dto';
 import { ListDeliveryRunsQueryDto } from './dto/list-delivery-runs-query.dto';
 import { DeliveryRunStockDto } from './dto/delivery-run-stock.dto';
+import { DeliveryRunRefillLoadDto } from './dto/delivery-run-refill-load.dto';
+import { assertValidStockQuantity, decimalQtyToNumber } from '../common/helpers/product-qty.helper';
 
 type DecimalLike = Prisma.Decimal | number | null | undefined;
 
@@ -47,38 +49,72 @@ export class DeliveryRunsService {
   async create(tenantId: string, dto: CreateDeliveryRunDto, actorId: string) {
     this.assertUniqueProducts(dto.openingStock);
     const date = parseDate(dto.date);
+    const refillLoads = dto.refillLoads ?? [];
+    const productIds = [
+      ...new Set([
+        ...dto.openingStock.map((stock) => stock.productId),
+        ...refillLoads.map((load) => load.productId),
+      ]),
+    ];
 
-    const run = await this.prisma.$transaction(async (tx) => {
-      await Promise.all([
-        this.assertRider(tx, tenantId, dto.riderId),
-        this.assertVehicle(tx, tenantId, dto.vehicleId),
-        this.assertProducts(
-          tx,
-          tenantId,
-          dto.openingStock.map((stock) => stock.productId),
-        ),
-      ]);
+    // Cheap checks outside the interactive transaction (Railway/MySQL latency).
+    await Promise.all([
+      this.assertRider(this.prisma, tenantId, dto.riderId),
+      this.assertVehicle(this.prisma, tenantId, dto.vehicleId),
+      this.assertProducts(this.prisma, tenantId, productIds),
+    ]);
+    await this.assertStockQuantities(this.prisma, tenantId, dto.openingStock);
 
-      return tx.deliveryRun.create({
-        data: {
-          tenantId,
-          riderId: dto.riderId,
-          vehicleId: dto.vehicleId,
-          date,
-          openingCash: dto.openingCash,
-          notes: dto.notes?.trim() || null,
-          stocks: {
-            create: dto.openingStock.map((stock) => ({
-              tenantId,
-              productId: stock.productId,
-              stockType: PrismaStockType.OPENING,
-              filledCount: stock.filledCount,
-              emptyCount: stock.emptyCount,
-            })),
+    const runId = await this.prisma.$transaction(
+      async (tx) => {
+        // Re-check remaining inside the tx so concurrent loads cannot overdraw.
+        const filledFromLoads = await this.resolveRefillLoads(tx, tenantId, refillLoads);
+        const openingStock = this.mergeOpeningStockWithRefillLoads(
+          dto.openingStock,
+          filledFromLoads,
+        );
+
+        const created = await tx.deliveryRun.create({
+          data: {
+            tenantId,
+            riderId: dto.riderId,
+            vehicleId: dto.vehicleId,
+            date,
+            openingCash: dto.openingCash,
+            notes: dto.notes?.trim() || null,
+            stocks: {
+              create: openingStock.map((stock) => ({
+                tenantId,
+                productId: stock.productId,
+                stockType: PrismaStockType.OPENING,
+                filledCount: stock.filledCount,
+                emptyCount: stock.emptyCount,
+              })),
+            },
+            ...(refillLoads.length > 0
+              ? {
+                  refillLoads: {
+                    create: refillLoads.map((load) => ({
+                      tenantId,
+                      refillBatchId: load.refillBatchId,
+                      productId: load.productId,
+                      quantityLoaded: load.quantityLoaded,
+                    })),
+                  },
+                }
+              : {}),
           },
-        },
-        include: this.detailInclude(),
-      });
+          select: { id: true },
+        });
+
+        return created.id;
+      },
+      { maxWait: 10_000, timeout: 20_000 },
+    );
+
+    const run = await this.prisma.deliveryRun.findFirstOrThrow({
+      where: { id: runId, tenantId },
+      include: this.detailInclude(),
     });
 
     await this.audit.write({
@@ -87,7 +123,16 @@ export class DeliveryRunsService {
       module: 'deliveryruns',
       action: 'CREATE',
       entityId: run.id,
-      newValue: { riderId: run.riderId, vehicleId: run.vehicleId, date: run.date },
+      newValue: {
+        riderId: run.riderId,
+        vehicleId: run.vehicleId,
+        date: run.date,
+        refillLoads: refillLoads.map((load) => ({
+          refillBatchId: load.refillBatchId,
+          productId: load.productId,
+          quantityLoaded: load.quantityLoaded,
+        })),
+      },
     });
 
     return this.toDetail(run);
@@ -160,6 +205,7 @@ export class DeliveryRunsService {
           tenantId,
           dto.openingStock.map((stock) => stock.productId),
         );
+        await this.assertStockQuantities(tx, tenantId, dto.openingStock);
         await this.assertOpeningStockNotBelowDelivered(tx, tenantId, id, dto.openingStock);
 
         for (const stock of dto.openingStock) {
@@ -235,6 +281,7 @@ export class DeliveryRunsService {
         tenantId,
         dto.closingStock.map((stock) => stock.productId),
       );
+      await this.assertStockQuantities(tx, tenantId, dto.closingStock);
 
       const totals = await this.computeTotals(tx, tenantId, id);
 
@@ -325,10 +372,10 @@ export class DeliveryRunsService {
     for (const stock of run.stocks) {
       const row = ensure(stock.productId, stock.product.name);
       if (stock.stockType === PrismaStockType.OPENING) {
-        row.openingFilled += stock.filledCount;
+        row.openingFilled += decimalQtyToNumber(stock.filledCount);
         row.openingEmpty += stock.emptyCount;
       } else {
-        row.closingFilled += stock.filledCount;
+        row.closingFilled += decimalQtyToNumber(stock.filledCount);
         row.closingEmpty += stock.emptyCount;
       }
     }
@@ -336,7 +383,7 @@ export class DeliveryRunsService {
     for (const delivery of run.deliveries) {
       for (const item of delivery.items) {
         const row = ensure(item.productId, item.product.name);
-        row.delivered += item.quantityDelivered;
+        row.delivered += decimalQtyToNumber(item.quantityDelivered);
         row.emptiesReturned += item.emptiesReceived;
       }
     }
@@ -403,7 +450,11 @@ export class DeliveryRunsService {
     };
   }
 
-  private async assertRider(tx: Prisma.TransactionClient, tenantId: string, riderId: string) {
+  private async assertRider(
+    tx: Prisma.TransactionClient | PrismaService,
+    tenantId: string,
+    riderId: string,
+  ) {
     const rider = await tx.user.findFirst({
       where: {
         id: riderId,
@@ -416,7 +467,11 @@ export class DeliveryRunsService {
     if (!rider) throw new BadRequestException('Rider must be an active rider in this workspace');
   }
 
-  private async assertVehicle(tx: Prisma.TransactionClient, tenantId: string, vehicleId: string) {
+  private async assertVehicle(
+    tx: Prisma.TransactionClient | PrismaService,
+    tenantId: string,
+    vehicleId: string,
+  ) {
     const vehicle = await tx.vehicle.findFirst({
       where: { id: vehicleId, tenantId, deletedAt: null, status: 'ACTIVE' },
       select: { id: true },
@@ -425,7 +480,7 @@ export class DeliveryRunsService {
   }
 
   private async assertProducts(
-    tx: Prisma.TransactionClient,
+    tx: Prisma.TransactionClient | PrismaService,
     tenantId: string,
     productIds: string[],
   ) {
@@ -438,11 +493,108 @@ export class DeliveryRunsService {
     }
   }
 
+  private async assertStockQuantities(
+    tx: Prisma.TransactionClient | PrismaService,
+    tenantId: string,
+    stock: DeliveryRunStockDto[],
+  ) {
+    if (stock.length === 0) return;
+    const products = await tx.product.findMany({
+      where: {
+        tenantId,
+        id: { in: stock.map((s) => s.productId) },
+        deletedAt: null,
+      },
+      select: { id: true, name: true, allowFractionalQty: true },
+    });
+    const byId = new Map(products.map((p) => [p.id, p]));
+    for (const row of stock) {
+      const product = byId.get(row.productId);
+      if (!product) continue;
+      assertValidStockQuantity(row.filledCount, product, 'units loaded');
+      if (!Number.isInteger(row.emptyCount)) {
+        throw new BadRequestException(`Empty count for "${product.name}" must be a whole number`);
+      }
+    }
+  }
+
   private assertUniqueProducts(stock: DeliveryRunStockDto[]): void {
     const ids = stock.map((row) => row.productId);
     if (new Set(ids).size !== ids.length) {
       throw new BadRequestException('Each product can appear only once in stock');
     }
+  }
+
+  /**
+   * Validate refill loads against batch remaining qty and return filledCount overrides by productId.
+   */
+  private async resolveRefillLoads(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    loads: DeliveryRunRefillLoadDto[],
+  ): Promise<Map<string, number>> {
+    const filledByProduct = new Map<string, number>();
+    if (loads.length === 0) return filledByProduct;
+
+    const batchIds = loads.map((load) => load.refillBatchId);
+    if (new Set(batchIds).size !== batchIds.length) {
+      throw new BadRequestException('Each refill batch can be loaded only once on a run');
+    }
+
+    const batches = await tx.refillBatch.findMany({
+      where: { tenantId, id: { in: batchIds } },
+      include: { loads: { select: { quantityLoaded: true } } },
+    });
+    const batchMap = new Map(batches.map((batch) => [batch.id, batch]));
+
+    for (const load of loads) {
+      const batch = batchMap.get(load.refillBatchId);
+      if (!batch) {
+        throw new BadRequestException(`Refill batch ${load.refillBatchId} not found`);
+      }
+      if (batch.productId !== load.productId) {
+        throw new BadRequestException(
+          `Refill batch product mismatch for batch ${load.refillBatchId}`,
+        );
+      }
+
+      const alreadyLoaded = batch.loads.reduce((sum, row) => sum + row.quantityLoaded, 0);
+      const remaining = batch.cansFilledCount - alreadyLoaded;
+      if (load.quantityLoaded > remaining) {
+        throw new BadRequestException(
+          `Cannot load ${load.quantityLoaded} from batch ${load.refillBatchId}; only ${remaining} remaining`,
+        );
+      }
+
+      filledByProduct.set(
+        load.productId,
+        (filledByProduct.get(load.productId) ?? 0) + load.quantityLoaded,
+      );
+    }
+
+    return filledByProduct;
+  }
+
+  /**
+   * When refillLoads are present for a product, opening filledCount = SUM(quantityLoaded).
+   * emptyCount always comes from client openingStock (or 0 if product only appears in loads).
+   */
+  private mergeOpeningStockWithRefillLoads(
+    openingStock: DeliveryRunStockDto[],
+    filledFromLoads: Map<string, number>,
+  ): DeliveryRunStockDto[] {
+    const byProduct = new Map(openingStock.map((stock) => [stock.productId, { ...stock }]));
+
+    for (const [productId, filledCount] of filledFromLoads) {
+      const existing = byProduct.get(productId);
+      if (existing) {
+        existing.filledCount = filledCount;
+      } else {
+        byProduct.set(productId, { productId, filledCount, emptyCount: 0 });
+      }
+    }
+
+    return [...byProduct.values()];
   }
 
   private async assertOpeningStockNotBelowDelivered(
@@ -477,14 +629,15 @@ export class DeliveryRunsService {
       for (const item of delivery.items) {
         deliveredByProduct.set(
           item.productId,
-          (deliveredByProduct.get(item.productId) ?? 0) + item.quantityDelivered,
+          (deliveredByProduct.get(item.productId) ?? 0) +
+            decimalQtyToNumber(item.quantityDelivered),
         );
       }
     }
 
     for (const stock of openingStock) {
       const delivered = deliveredByProduct.get(stock.productId) ?? 0;
-      if (stock.filledCount < delivered) {
+      if (stock.filledCount + 1e-9 < delivered) {
         const name = nameById.get(stock.productId) ?? 'product';
         throw new BadRequestException(
           `Opening filled for "${name}" cannot be below already delivered qty (${delivered})`,
@@ -498,6 +651,19 @@ export class DeliveryRunsService {
       rider: { select: { id: true, firstName: true, lastName: true, email: true } },
       vehicle: { select: { id: true, name: true, plateNumber: true, type: true } },
       stocks: { include: { product: { select: { id: true, name: true } } } },
+      refillLoads: {
+        include: {
+          product: { select: { id: true, name: true } },
+          refillBatch: {
+            select: {
+              id: true,
+              date: true,
+              cansFilledCount: true,
+              costPerUnit: true,
+            },
+          },
+        },
+      },
       deliveries: {
         orderBy: { deliveryDate: 'desc' as const },
         include: {
@@ -574,16 +740,29 @@ export class DeliveryRunsService {
         id: stock.id,
         productId: stock.productId,
         stockType: stock.stockType as StockType,
-        filledCount: stock.filledCount,
+        filledCount: decimalQtyToNumber(stock.filledCount),
         emptyCount: stock.emptyCount,
         product: stock.product,
+      })),
+      refillLoads: row.refillLoads.map((load) => ({
+        id: load.id,
+        refillBatchId: load.refillBatchId,
+        productId: load.productId,
+        quantityLoaded: load.quantityLoaded,
+        product: load.product,
+        refillBatch: {
+          id: load.refillBatch.id,
+          date: load.refillBatch.date,
+          cansFilledCount: load.refillBatch.cansFilledCount,
+          costPerUnit: decimalToNumber(load.refillBatch.costPerUnit),
+        },
       })),
       deliveries: row.deliveries.map((delivery) => {
         const items = delivery.items.map((item) => ({
           id: item.id,
           productId: item.productId,
           product: item.product,
-          quantityDelivered: item.quantityDelivered,
+          quantityDelivered: decimalQtyToNumber(item.quantityDelivered),
           emptiesReceived: item.emptiesReceived,
           sellingPriceSnapshot: decimalToNumber(item.sellingPriceSnapshot),
           unitCostSnapshot: decimalToNumber(item.unitCostSnapshot),

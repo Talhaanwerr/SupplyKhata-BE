@@ -21,9 +21,9 @@ export class CreateDeliveryItemDto {
   @IsString()
   productId!: string;
 
-  @ApiProperty({ example: 3 })
+  @ApiProperty({ example: 3, description: 'Quantity in product baseUnit (PCS / LTR / KG)' })
   @Type(() => Number)
-  @IsInt()
+  @IsNumber({ maxDecimalPlaces: 3 })
   @Min(0)
   quantityDelivered!: number;
 

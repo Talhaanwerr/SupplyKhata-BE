@@ -31,6 +31,18 @@ export class CustomerProductPriceInputDto {
   pricePerUnit!: number;
 }
 
+export class OpeningContainerInputDto {
+  @ApiProperty()
+  @IsString()
+  productId!: string;
+
+  @ApiProperty({ example: 2 })
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  quantity!: number;
+}
+
 export class CreateCustomerDto {
   @ApiProperty({ example: 'Ahmed Store' })
   @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
@@ -146,4 +158,15 @@ export class CreateCustomerDto {
   @ValidateNested({ each: true })
   @Type(() => CustomerProductPriceInputDto)
   customerProductPrices?: CustomerProductPriceInputDto[];
+
+  @ApiPropertyOptional({
+    type: [OpeningContainerInputDto],
+    description: 'Day-0 cans already with customer (returnable products only)',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(100)
+  @ValidateNested({ each: true })
+  @Type(() => OpeningContainerInputDto)
+  openingContainers?: OpeningContainerInputDto[];
 }
