@@ -84,7 +84,7 @@ describe('Tenants (e2e)', () => {
     });
   };
 
-  const mockTenantUserAuth = () => {
+  const mockTenantUserAuth = (_tenantId?: string) => {
     e2ePrisma.user.findUnique.mockResolvedValue({
       id: 'user-e2e',
       email: 'user@acme.com',
