@@ -75,6 +75,8 @@ const PERMISSION_MODULES = [
   'containers',
   'reports',
   'collections',
+  'schedules',
+  'planned-stops',
 ];
 
 const PERMISSION_ACTIONS = ['create', 'read', 'update', 'delete', 'manage'];
@@ -377,6 +379,14 @@ async function main(): Promise<void> {
       'collections:read',
       'collections:update',
       'collections:delete',
+      'schedules:create',
+      'schedules:read',
+      'schedules:update',
+      'schedules:delete',
+      'planned-stops:create',
+      'planned-stops:read',
+      'planned-stops:update',
+      'planned-stops:delete',
     ]),
     permissions,
   );
@@ -435,6 +445,13 @@ async function main(): Promise<void> {
       'collections:create',
       'collections:read',
       'collections:update',
+      'schedules:create',
+      'schedules:read',
+      'schedules:update',
+      'planned-stops:create',
+      'planned-stops:read',
+      'planned-stops:update',
+      'planned-stops:delete',
     ]),
     permissions,
   );
@@ -462,6 +479,10 @@ async function main(): Promise<void> {
       'containers:read',
       'collections:create',
       'collections:read',
+      'schedules:read',
+      'planned-stops:create',
+      'planned-stops:read',
+      'planned-stops:update',
     ]),
     permissions,
   );

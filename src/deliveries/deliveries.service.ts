@@ -23,6 +23,7 @@ import { PaginatedData } from '../common/types/api-response.type';
 import { DeliveryStatus } from '../common/enums/delivery.enum';
 import { CreateDeliveryDto } from './dto/create-delivery.dto';
 import { ListDeliveriesQueryDto } from './dto/list-deliveries-query.dto';
+import { SchedulingService } from '../scheduling/scheduling.service';
 
 type DecimalLike = Prisma.Decimal | number | null | undefined;
 
@@ -56,6 +57,7 @@ export class DeliveriesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditLogsService,
+    private readonly scheduling: SchedulingService,
   ) {}
 
   async create(tenantId: string, dto: CreateDeliveryDto, actorId: string) {
@@ -341,6 +343,16 @@ export class DeliveriesService {
           });
         }
 
+        if (dto.plannedStopId) {
+          await this.scheduling.completeStopInTx(tx, {
+            tenantId,
+            plannedStopId: dto.plannedStopId,
+            deliveryId: created.id,
+            customerId: dto.customerId,
+            deliveryDate: parseDate(dto.deliveryDate),
+          });
+        }
+
         return created.id;
       },
       { maxWait: 10_000, timeout: 20_000 },
@@ -509,6 +521,12 @@ export class DeliveriesService {
             },
           });
         }
+
+        await this.scheduling.revertStopOnDeliveryCancelInTx(tx, {
+          tenantId,
+          deliveryId: id,
+          customerId: delivery.customerId,
+        });
       },
       { maxWait: 10_000, timeout: 20_000 },
     );

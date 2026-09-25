@@ -1,10 +1,12 @@
 import { Module } from '@nestjs/common';
 import { PermissionsGuard } from '../common/guards/permissions.guard';
 import { TenantGuard } from '../common/guards/tenant.guard';
+import { SchedulingModule } from '../scheduling/scheduling.module';
 import { DeliveryRunsController } from './delivery-runs.controller';
 import { DeliveryRunsService } from './delivery-runs.service';
 
 @Module({
+  imports: [SchedulingModule],
   controllers: [DeliveryRunsController],
   providers: [DeliveryRunsService, PermissionsGuard, TenantGuard],
   exports: [DeliveryRunsService],

@@ -7,15 +7,20 @@ import { CurrentTenant } from '../common/decorators/current-tenant.decorator';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { AuthenticatedUser } from '../auth/types/jwt-payload.type';
 import { DeliveryRunsService } from './delivery-runs.service';
+import { SchedulingService } from '../scheduling/scheduling.service';
 import { CreateDeliveryRunDto } from './dto/create-delivery-run.dto';
 import { CloseDeliveryRunDto } from './dto/close-delivery-run.dto';
 import { UpdateDeliveryRunDto } from './dto/update-delivery-run.dto';
 import { ListDeliveryRunsQueryDto } from './dto/list-delivery-runs-query.dto';
+import { IncludePlannedStopsDto } from '../scheduling/dto/planned-stops.dto';
 
 @UseGuards(JwtAuthGuard, TenantGuard, PermissionsGuard)
 @Controller({ path: 'delivery-runs', version: '1' })
 export class DeliveryRunsController {
-  constructor(private readonly deliveryRunsService: DeliveryRunsService) {}
+  constructor(
+    private readonly deliveryRunsService: DeliveryRunsService,
+    private readonly scheduling: SchedulingService,
+  ) {}
 
   @Post()
   @RequirePermissions('deliveryruns:create')
@@ -65,5 +70,16 @@ export class DeliveryRunsController {
   @RequirePermissions('deliveryruns:read')
   summary(@Param('id') id: string, @CurrentTenant() tenantId: string) {
     return this.deliveryRunsService.summary(id, tenantId);
+  }
+
+  @Post(':id/include-planned-stops')
+  @RequirePermissions('planned-stops:update')
+  includePlannedStops(
+    @Param('id') id: string,
+    @Body() dto: IncludePlannedStopsDto,
+    @CurrentTenant() tenantId: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.scheduling.includeInRun(id, tenantId, dto, user.id);
   }
 }

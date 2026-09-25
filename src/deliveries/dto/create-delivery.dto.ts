@@ -81,6 +81,13 @@ export class CreateDeliveryDto {
   @Min(0)
   promisedAmount?: number;
 
+  @ApiPropertyOptional({
+    description: 'When set, marks this planned stop COMPLETED and advances the schedule cadence',
+  })
+  @IsOptional()
+  @IsString()
+  plannedStopId?: string;
+
   @ApiProperty({ type: [CreateDeliveryItemDto] })
   @IsArray()
   @ArrayMinSize(1)

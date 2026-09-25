@@ -29,6 +29,7 @@ import { ContainerInventoryModule } from './container-inventory/container-invent
 import { DashboardModule } from './dashboard/dashboard.module';
 import { ReportsModule } from './reports/reports.module';
 import { CollectionsModule } from './collections/collections.module';
+import { SchedulingModule } from './scheduling/scheduling.module';
 import { envValidationSchema } from './config/env.validation';
 import { winstonConfig } from './config/logger.config';
 
@@ -80,6 +81,7 @@ import { winstonConfig } from './config/logger.config';
     DashboardModule,
     ReportsModule,
     CollectionsModule,
+    SchedulingModule,
   ],
 })
 export class AppModule {}
