@@ -42,6 +42,7 @@ jobs:
       MAIL_FROM: noreply@test.local
       MAIL_FROM_NAME: Test
       FRONTEND_URL: http://localhost:3010
+      API_PUBLIC_URL: http://localhost:4700
       THROTTLE_TTL: 60000
       THROTTLE_LIMIT: 100
       LOGIN_MAX_ATTEMPTS: 5

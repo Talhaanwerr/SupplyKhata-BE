@@ -27,11 +27,11 @@ export const envValidationSchema = Joi.object({
   LOGIN_MAX_ATTEMPTS: Joi.number().default(5),
   LOGIN_LOCKOUT_MINUTES: Joi.number().default(15),
 
-  // Email
+  // Email (credentials may be empty in CI / local without SMTP)
   MAIL_HOST: Joi.string().default('smtp.mailtrap.io'),
   MAIL_PORT: Joi.number().default(2525),
-  MAIL_USER: Joi.string().default(''),
-  MAIL_PASS: Joi.string().default(''),
+  MAIL_USER: Joi.string().allow('').default(''),
+  MAIL_PASS: Joi.string().allow('').default(''),
   MAIL_FROM: Joi.string().default('noreply@saas.local'),
   MAIL_FROM_NAME: Joi.string().default('SaaS Platform'),
   // Optional: Brevo HTTPS API (required on Railway Hobby — SMTP ports are blocked)

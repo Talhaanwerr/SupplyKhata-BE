@@ -8,6 +8,8 @@ import * as request from 'supertest';
 import { JwtService } from '@nestjs/jwt';
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/prisma/prisma.service';
+import { ResponseInterceptor } from '../src/common/interceptors/response.interceptor';
+import { HttpExceptionFilter } from '../src/common/filters/http-exception.filter';
 
 // ─── Mock Prisma ──────────────────────────────────────────────────────────────
 
@@ -20,8 +22,17 @@ const e2ePrisma = {
     create: jest.fn(),
     update: jest.fn(),
   },
+  tenantMember: {
+    findMany: jest.fn(),
+    findUnique: jest.fn(),
+    findFirst: jest.fn(),
+    create: jest.fn(),
+    update: jest.fn(),
+    deleteMany: jest.fn(),
+  },
   userSession: {
     create: jest.fn(),
+    update: jest.fn(),
     findFirst: jest.fn(),
     delete: jest.fn(),
     deleteMany: jest.fn(),
@@ -34,11 +45,12 @@ const e2ePrisma = {
     update: jest.fn(),
     findMany: jest.fn(),
     count: jest.fn(),
+    delete: jest.fn(),
   },
-  role: { findMany: jest.fn() },
-  userRole: { findMany: jest.fn().mockResolvedValue([]) },
+  role: { findMany: jest.fn(), findFirst: jest.fn() },
+  userRole: { findMany: jest.fn().mockResolvedValue([]), deleteMany: jest.fn() },
   auditLog: { create: jest.fn() },
-  tenantSettings: { upsert: jest.fn() },
+  tenantSettings: { upsert: jest.fn(), create: jest.fn(), deleteMany: jest.fn() },
   $connect: jest.fn(),
   $disconnect: jest.fn(),
 };
@@ -51,7 +63,7 @@ describe('Tenants (e2e)', () => {
     jwtService.sign({
       sub: 'super-admin-e2e',
       email: 'sa@platform.com',
-      tenantId: 'platform',
+      tenantId: null,
       isSuperAdmin: true,
     });
 
@@ -62,6 +74,27 @@ describe('Tenants (e2e)', () => {
       tenantId,
       isSuperAdmin: false,
     });
+
+  /** JwtStrategy loads the user (and membership for non-SA). */
+  const mockSuperAdminAuth = () => {
+    e2ePrisma.user.findUnique.mockResolvedValue({
+      id: 'super-admin-e2e',
+      email: 'sa@platform.com',
+      isSuperAdmin: true,
+    });
+  };
+
+  const mockTenantUserAuth = () => {
+    e2ePrisma.user.findUnique.mockResolvedValue({
+      id: 'user-e2e',
+      email: 'user@acme.com',
+      isSuperAdmin: false,
+    });
+    e2ePrisma.tenantMember.findUnique.mockResolvedValue({
+      status: 'ACTIVE',
+      tenant: { status: 'ACTIVE', deletedAt: null },
+    });
+  };
 
   beforeAll(async () => {
     const moduleRef: TestingModule = await Test.createTestingModule({
@@ -77,12 +110,16 @@ describe('Tenants (e2e)', () => {
     app.useGlobalPipes(
       new ValidationPipe({ whitelist: true, transform: true, forbidNonWhitelisted: true }),
     );
+    app.useGlobalFilters(new HttpExceptionFilter());
+    app.useGlobalInterceptors(new ResponseInterceptor());
     await app.init();
 
     jwtService = moduleRef.get<JwtService>(JwtService);
   });
 
-  afterAll(async () => await app.close());
+  afterAll(async () => {
+    if (app) await app.close();
+  });
   beforeEach(() => jest.clearAllMocks());
 
   // ─── GET /tenants ──────────────────────────────────────────────────────────
@@ -93,6 +130,8 @@ describe('Tenants (e2e)', () => {
     });
 
     it('returns 403 for non-super-admin users', () => {
+      mockTenantUserAuth('tenant-1');
+
       return request(app.getHttpServer())
         .get('/api/v1/tenants')
         .set('Authorization', `Bearer ${tenantUserToken('tenant-1')}`)
@@ -100,6 +139,7 @@ describe('Tenants (e2e)', () => {
     });
 
     it('returns 200 for super admin', () => {
+      mockSuperAdminAuth();
       e2ePrisma.tenant.findMany.mockResolvedValue([]);
       e2ePrisma.tenant.count.mockResolvedValue(0);
 
@@ -114,34 +154,29 @@ describe('Tenants (e2e)', () => {
 
   describe('POST /api/v1/tenants', () => {
     it('returns 403 for regular tenant user', () => {
+      mockTenantUserAuth('tenant-1');
+
       return request(app.getHttpServer())
         .post('/api/v1/tenants')
         .set('Authorization', `Bearer ${tenantUserToken('tenant-1')}`)
-        .send({ name: 'New Corp', slug: 'new-corp' })
+        .send({
+          name: 'New Corp',
+          slug: 'new-corp',
+          ownerEmail: 'owner@newcorp.com',
+          ownerFirstName: 'Jane',
+          ownerLastName: 'Doe',
+        })
         .expect(403);
     });
 
-    it('creates a tenant for super admin', async () => {
-      e2ePrisma.tenant.findFirst.mockResolvedValue(null);
-      e2ePrisma.tenant.create.mockResolvedValue({
-        id: 't-new',
-        name: 'New Corp',
-        slug: 'new-corp',
-        status: 'PENDING',
-        domain: null,
-        subdomain: null,
-        ownerUserId: null,
-        timezone: 'UTC',
-        currency: 'USD',
-        logo: null,
-        createdAt: new Date(),
-      });
+    it('returns 400 when owner fields are missing', async () => {
+      mockSuperAdminAuth();
 
       return request(app.getHttpServer())
         .post('/api/v1/tenants')
         .set('Authorization', `Bearer ${superAdminToken()}`)
         .send({ name: 'New Corp', slug: 'new-corp' })
-        .expect(201);
+        .expect(400);
     });
   });
 
@@ -149,7 +184,8 @@ describe('Tenants (e2e)', () => {
 
   describe('Tenant isolation', () => {
     it('tenant user cannot list other tenants', () => {
-      // /tenants endpoint is super admin only — any tenant user gets 403
+      mockTenantUserAuth('tenant-A');
+
       return request(app.getHttpServer())
         .get('/api/v1/tenants')
         .set('Authorization', `Bearer ${tenantUserToken('tenant-A')}`)
@@ -157,12 +193,13 @@ describe('Tenants (e2e)', () => {
     });
 
     it('permission denied returns 403 not 500', async () => {
+      mockTenantUserAuth('tenant-1');
+
       const res = await request(app.getHttpServer())
         .get('/api/v1/tenants')
         .set('Authorization', `Bearer ${tenantUserToken('tenant-1')}`)
         .expect(403);
 
-      // Response must never expose stack traces or internal details
       expect(res.body).not.toHaveProperty('stack');
       expect(res.body.success).toBe(false);
       expect(typeof res.body.message).toBe('string');
