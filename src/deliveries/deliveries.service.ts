@@ -15,10 +15,10 @@ import { clearPromisedDueIfSettled } from '../common/helpers/promised-due.helper
 import {
   assertNoEmptiesWhenContainersDisabled,
   isReturnableContainersEnabled,
+  packagingUnitsOutForDelivery,
   RETURNABLE_CONTAINERS_DISABLED_MESSAGE,
 } from '../common/helpers/returnable-containers.helper';
 import { assertValidBaseQuantity, decimalQtyToNumber } from '../common/helpers/product-qty.helper';
-import { ProductBaseUnit } from '../common/enums/product.enum';
 import { PaginatedData } from '../common/types/api-response.type';
 import { DeliveryStatus } from '../common/enums/delivery.enum';
 import { CreateDeliveryDto } from './dto/create-delivery.dto';
@@ -100,6 +100,7 @@ export class DeliveriesService {
           isReturnable: true,
           baseUnit: true,
           allowFractionalQty: true,
+          containerCapacity: true,
         },
       }),
       this.prisma.customerProductPrice.findMany({
@@ -140,12 +141,13 @@ export class DeliveriesService {
       productId: string;
       quantityDelivered: number;
       emptiesReceived: number;
+      containersDelivered: number;
       sellingPriceSnapshot: Prisma.Decimal;
       unitCostSnapshot: Prisma.Decimal;
       lineTotal: Prisma.Decimal;
       trackContainers: boolean;
-      /** PCS only — litres/kg sale qty is not a packaging movement count. */
-      moveContainersOut: boolean;
+      /** Whole packaging units (cans) leaving with customer; 0 = no DELIVERED_TO_CUSTOMER. */
+      packagingUnitsOut: number;
     }> = [];
 
     for (const item of dto.items) {
@@ -176,15 +178,19 @@ export class DeliveriesService {
 
       const sellingPrice = priceMap.get(item.productId) ?? product.defaultSellingPrice;
       const lineTotal = new Prisma.Decimal(sellingPrice).mul(item.quantityDelivered);
+      const packagingUnitsOut = trackContainers
+        ? packagingUnitsOutForDelivery(product, item.quantityDelivered, item.containersDelivered)
+        : 0;
       resolvedItems.push({
         productId: item.productId,
         quantityDelivered: item.quantityDelivered,
         emptiesReceived: trackContainers ? rawEmpties : 0,
+        containersDelivered: packagingUnitsOut,
         sellingPriceSnapshot: sellingPrice,
         unitCostSnapshot: cost,
         lineTotal,
         trackContainers,
-        moveContainersOut: trackContainers && product.baseUnit === ProductBaseUnit.PCS,
+        packagingUnitsOut,
       });
     }
 
@@ -234,6 +240,7 @@ export class DeliveriesService {
                 tenantId,
                 productId: item.productId,
                 quantityDelivered: item.quantityDelivered,
+                containersDelivered: item.containersDelivered,
                 emptiesReceived: item.emptiesReceived,
                 sellingPriceSnapshot: item.sellingPriceSnapshot,
                 unitCostSnapshot: item.unitCostSnapshot,
@@ -253,21 +260,14 @@ export class DeliveriesService {
         const trackByProduct = new Map(
           resolvedItems.map((item) => [
             item.productId,
-            { track: item.trackContainers, moveOut: item.moveContainersOut },
+            { track: item.trackContainers, packagingUnitsOut: item.packagingUnitsOut },
           ]),
         );
         for (const createdItem of created.items) {
           const flags = trackByProduct.get(createdItem.productId);
           if (!flags?.track) continue;
 
-          const qtyOut = decimalQtyToNumber(createdItem.quantityDelivered);
-          // Only PCS: sale qty = packaging units. LTR/KG sale qty is not a can count.
-          if (flags.moveOut && qtyOut > 0) {
-            if (!Number.isInteger(qtyOut)) {
-              throw new BadRequestException(
-                'Container movements require whole packaging units for PCS products',
-              );
-            }
+          if (flags.packagingUnitsOut > 0) {
             movements.push({
               tenantId,
               productId: createdItem.productId,
@@ -275,7 +275,7 @@ export class DeliveriesService {
               customerId: dto.customerId,
               vehicleId: openRun.vehicleId,
               movementType: PrismaContainerMovementType.DELIVERED_TO_CUSTOMER,
-              quantity: qtyOut,
+              quantity: flags.packagingUnitsOut,
               notes: 'Delivery sale',
             });
           }
@@ -563,10 +563,16 @@ export class DeliveriesService {
     tx: Prisma.TransactionClient,
     tenantId: string,
     deliveryRunId: string,
-    items: Array<{ productId: string; quantityDelivered: number }>,
+    items: Array<{
+      productId: string;
+      quantityDelivered: number;
+      packagingUnitsOut: number;
+    }>,
     productMap: Map<string, { id: string; name: string }>,
   ): Promise<void> {
-    const deliverItems = items.filter((item) => item.quantityDelivered > 0);
+    const deliverItems = items.filter(
+      (item) => item.quantityDelivered > 0 || item.packagingUnitsOut > 0,
+    );
     if (deliverItems.length === 0) return;
 
     const productIds = deliverItems.map((item) => item.productId);
@@ -578,7 +584,7 @@ export class DeliveriesService {
           stockType: PrismaStockType.OPENING,
           productId: { in: productIds },
         },
-        select: { productId: true, filledCount: true },
+        select: { productId: true, filledCount: true, filledPackagingCount: true },
       }),
       tx.delivery.findMany({
         where: {
@@ -589,7 +595,11 @@ export class DeliveriesService {
         select: {
           items: {
             where: { productId: { in: productIds } },
-            select: { productId: true, quantityDelivered: true },
+            select: {
+              productId: true,
+              quantityDelivered: true,
+              containersDelivered: true,
+            },
           },
         },
       }),
@@ -598,22 +608,38 @@ export class DeliveriesService {
     const openingFilled = new Map(
       openingStocks.map((row) => [row.productId, decimalQtyToNumber(row.filledCount)]),
     );
+    const openingCans = new Map(
+      openingStocks.map((row) => [row.productId, row.filledPackagingCount]),
+    );
     const alreadyDelivered = new Map<string, number>();
+    const alreadyCans = new Map<string, number>();
     for (const delivery of priorDeliveries) {
       for (const item of delivery.items) {
         alreadyDelivered.set(
           item.productId,
           (alreadyDelivered.get(item.productId) ?? 0) + decimalQtyToNumber(item.quantityDelivered),
         );
+        alreadyCans.set(
+          item.productId,
+          (alreadyCans.get(item.productId) ?? 0) + item.containersDelivered,
+        );
       }
     }
 
-    const requested = new Map<string, number>();
+    const requestedQty = new Map<string, number>();
+    const requestedCans = new Map<string, number>();
     for (const item of deliverItems) {
-      requested.set(item.productId, (requested.get(item.productId) ?? 0) + item.quantityDelivered);
+      requestedQty.set(
+        item.productId,
+        (requestedQty.get(item.productId) ?? 0) + item.quantityDelivered,
+      );
+      requestedCans.set(
+        item.productId,
+        (requestedCans.get(item.productId) ?? 0) + item.packagingUnitsOut,
+      );
     }
 
-    for (const [productId, qty] of requested) {
+    for (const [productId, qty] of requestedQty) {
       const opening = openingFilled.get(productId) ?? 0;
       const used = alreadyDelivered.get(productId) ?? 0;
       const available = opening - used;
@@ -621,6 +647,19 @@ export class DeliveriesService {
         const name = productMap.get(productId)?.name ?? 'product';
         throw new BadRequestException(
           `Only ${available} units left on this run for "${name}" (opening ${opening}, already delivered ${used})`,
+        );
+      }
+    }
+
+    for (const [productId, cans] of requestedCans) {
+      if (cans <= 0) continue;
+      const opening = openingCans.get(productId) ?? 0;
+      const used = alreadyCans.get(productId) ?? 0;
+      const available = opening - used;
+      if (cans > available) {
+        const name = productMap.get(productId)?.name ?? 'product';
+        throw new BadRequestException(
+          `Only ${available} filled cans left on this run for "${name}" (opening ${opening}, already given ${used})`,
         );
       }
     }
@@ -665,12 +704,16 @@ export class DeliveriesService {
       totalSale,
       productsSummary: row.items
         .filter(
-          (item) => decimalQtyToNumber(item.quantityDelivered) > 0 || item.emptiesReceived > 0,
-        )
-        .map(
           (item) =>
-            `${item.product.name} (${decimalQtyToNumber(item.quantityDelivered)} del / ${item.emptiesReceived} empty)`,
+            decimalQtyToNumber(item.quantityDelivered) > 0 ||
+            item.containersDelivered > 0 ||
+            item.emptiesReceived > 0,
         )
+        .map((item) => {
+          const qty = decimalQtyToNumber(item.quantityDelivered);
+          const cans = item.containersDelivered > 0 ? ` / ${item.containersDelivered} cans` : '';
+          return `${item.product.name} (${qty} del${cans} / ${item.emptiesReceived} empty)`;
+        })
         .join(', '),
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
@@ -687,6 +730,7 @@ export class DeliveriesService {
         productId: item.productId,
         product: item.product,
         quantityDelivered: decimalQtyToNumber(item.quantityDelivered),
+        containersDelivered: item.containersDelivered,
         emptiesReceived: item.emptiesReceived,
         sellingPriceSnapshot: decimalToNumber(item.sellingPriceSnapshot),
         unitCostSnapshot: decimalToNumber(item.unitCostSnapshot),

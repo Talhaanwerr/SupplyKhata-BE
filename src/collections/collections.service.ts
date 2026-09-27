@@ -34,6 +34,12 @@ function ageDaysFromLedger(
   entries: Array<{ amount: DecimalLike; createdAt: Date }>,
   now: Date,
 ): number {
+  const oldest = oldestOpenDebitAt(entries);
+  if (!oldest) return 0;
+  return daysBetween(oldest, now);
+}
+
+function oldestOpenDebitAt(entries: Array<{ amount: DecimalLike; createdAt: Date }>): Date | null {
   const open: Array<{ remaining: number; createdAt: Date }> = [];
   for (const entry of entries) {
     const amount = decimalToNumber(entry.amount);
@@ -52,8 +58,7 @@ function ageDaysFromLedger(
       }
     }
   }
-  if (open.length === 0) return 0;
-  return daysBetween(open[0].createdAt, now);
+  return open.length === 0 ? null : open[0].createdAt;
 }
 
 function parseDay(value: string): Date {
@@ -173,7 +178,10 @@ export class CollectionsService {
         } else if (!isCod && cycleLast) {
           const pastDue = today.getTime() > cycleLast.getTime();
           const unpaidSinceDue = !lastPay || startOfDay(lastPay).getTime() < cycleLast.getTime();
-          if (pastDue && unpaidSinceDue) {
+          const openSince = oldestOpenDebitAt(ledgerByCustomer.get(c.id) ?? []);
+          const balancePredatesDue =
+            !!openSince && startOfDay(openSince).getTime() <= cycleLast.getTime();
+          if (pastDue && unpaidSinceDue && balancePredatesDue) {
             dueDate = cycleLast;
             rowBucket = CollectionBucket.OVERDUE;
             daysOverdue = daysBetween(cycleLast, now);

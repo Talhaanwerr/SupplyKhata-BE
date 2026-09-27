@@ -9,6 +9,10 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AuditLogsService } from '../audit-logs/audit-logs.service';
 import { ProductBaseUnit } from '../common/enums/product.enum';
 import { normalizePackFields } from '../common/helpers/product-qty.helper';
+import {
+  assertNoPackFieldsWhenDisabled,
+  isPackHelpersEnabled,
+} from '../common/helpers/pack-helpers.helper';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { ListProductsQueryDto } from './dto/list-products-query.dto';
@@ -152,19 +156,30 @@ export class ProductsService {
 
     await this.assertNameUnique(tenantId, name);
 
-    const pack = normalizePackFields({
+    const packHelpersEnabled = await isPackHelpersEnabled(this.prisma, tenantId);
+    assertNoPackFieldsWhenDisabled(packHelpersEnabled, {
       unitsPerPack: dto.unitsPerPack,
       packLabel: dto.packLabel,
     });
-    const allowFractionalQty =
-      dto.allowFractionalQty ??
-      (dto.baseUnit === ProductBaseUnit.LTR || dto.baseUnit === ProductBaseUnit.KG);
+
+    const pack = packHelpersEnabled
+      ? normalizePackFields({
+          unitsPerPack: dto.unitsPerPack,
+          packLabel: dto.packLabel,
+        })
+      : { unitsPerPack: null, packLabel: null };
+
+    const isKg = dto.baseUnit === ProductBaseUnit.KG;
+    const allowFractionalQty = isKg
+      ? false
+      : (dto.allowFractionalQty ?? dto.baseUnit === ProductBaseUnit.LTR);
+    const volume = isKg ? null : (dto.volume ?? null);
 
     const product = await this.prisma.product.create({
       data: {
         tenantId,
         name,
-        volume: dto.volume ?? null,
+        volume,
         unit: dto.unit?.trim() || defaultUnitLabel(dto.baseUnit),
         sku: dto.sku?.trim() || null,
         defaultSellingPrice: dto.defaultSellingPrice,
@@ -238,27 +253,47 @@ export class ProductsService {
       await this.assertNameUnique(tenantId, name, id);
     }
 
-    const packTouched = dto.unitsPerPack !== undefined || dto.packLabel !== undefined;
+    const packHelpersEnabled = await isPackHelpersEnabled(this.prisma, tenantId);
+    if (dto.unitsPerPack !== undefined || dto.packLabel !== undefined) {
+      assertNoPackFieldsWhenDisabled(packHelpersEnabled, {
+        unitsPerPack: dto.unitsPerPack,
+        packLabel: dto.packLabel,
+      });
+    }
+
+    const packTouched =
+      packHelpersEnabled && (dto.unitsPerPack !== undefined || dto.packLabel !== undefined);
     const pack = packTouched
       ? normalizePackFields({
           unitsPerPack: dto.unitsPerPack !== undefined ? dto.unitsPerPack : existing.unitsPerPack,
           packLabel: dto.packLabel !== undefined ? dto.packLabel : existing.packLabel,
         })
-      : null;
+      : !packHelpersEnabled && (existing.unitsPerPack != null || existing.packLabel != null)
+        ? { unitsPerPack: null, packLabel: null }
+        : null;
 
     const nextBaseUnit = (dto.baseUnit ?? existing.baseUnit) as ProductBaseUnit;
-    const allowFractionalQty =
-      dto.allowFractionalQty !== undefined
-        ? dto.allowFractionalQty
-        : dto.baseUnit !== undefined
-          ? nextBaseUnit === ProductBaseUnit.LTR || nextBaseUnit === ProductBaseUnit.KG
-          : undefined;
+    const isKg = nextBaseUnit === ProductBaseUnit.KG;
+    let allowFractionalQty: boolean | undefined;
+    if (isKg) {
+      allowFractionalQty = false;
+    } else if (dto.allowFractionalQty !== undefined) {
+      allowFractionalQty = dto.allowFractionalQty;
+    } else if (dto.baseUnit !== undefined) {
+      allowFractionalQty = nextBaseUnit === ProductBaseUnit.LTR;
+    }
+
+    const volumeUpdate = isKg
+      ? { volume: null as number | null }
+      : dto.volume !== undefined
+        ? { volume: dto.volume }
+        : {};
 
     const updated = await this.prisma.product.update({
       where: { id },
       data: {
         ...(dto.name !== undefined ? { name: dto.name.trim() } : {}),
-        ...(dto.volume !== undefined ? { volume: dto.volume } : {}),
+        ...volumeUpdate,
         ...(dto.unit !== undefined
           ? { unit: dto.unit?.trim() || null }
           : dto.baseUnit !== undefined

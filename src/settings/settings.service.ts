@@ -5,6 +5,11 @@ import { AuditLogsService } from '../audit-logs/audit-logs.service';
 import { FilesService } from '../files/files.service';
 import { FileVisibility } from '../files/dto/list-files-query.dto';
 import { UpdateSettingsDto } from './dto/update-settings.dto';
+import {
+  normalizeSidebarNavInput,
+  parseSidebarNav,
+  type SidebarNavPrefs,
+} from '../common/helpers/sidebar-nav.helper';
 
 type TenantSettings = {
   id: string;
@@ -19,6 +24,7 @@ type TenantSettings = {
   invoicePrefix: string;
   themeColor: string;
   allowedDomains: string[];
+  sidebarNav: SidebarNavPrefs;
   createdAt: Date;
   updatedAt: Date;
 };
@@ -46,6 +52,7 @@ function mapSettings(row: {
   invoicePrefix: string;
   themeColor: string;
   allowedDomains: Prisma.JsonValue;
+  sidebarNav: Prisma.JsonValue;
   createdAt: Date;
   updatedAt: Date;
 }): TenantSettings {
@@ -53,7 +60,11 @@ function mapSettings(row: {
   const allowedDomains = Array.isArray(raw)
     ? raw.filter((d): d is string => typeof d === 'string')
     : [];
-  return { ...row, allowedDomains };
+  return {
+    ...row,
+    allowedDomains,
+    sidebarNav: parseSidebarNav(row.sidebarNav),
+  };
 }
 
 @Injectable()
@@ -63,6 +74,16 @@ export class SettingsService {
     private readonly audit: AuditLogsService,
     private readonly filesService: FilesService,
   ) {}
+
+  async getSidebarNav(tenantId: string): Promise<SidebarNavPrefs> {
+    const settings = await this.prisma.tenantSettings.upsert({
+      where: { tenantId },
+      update: {},
+      create: { tenantId },
+      select: { sidebarNav: true },
+    });
+    return parseSidebarNav(settings.sidebarNav);
+  }
 
   async get(tenantId: string): Promise<TenantSettings> {
     const settings = await this.prisma.tenantSettings.upsert({
@@ -76,6 +97,7 @@ export class SettingsService {
   async update(tenantId: string, dto: UpdateSettingsDto, actorId: string): Promise<TenantSettings> {
     const old = await this.get(tenantId);
     const domains = normalizeDomains(dto.allowedDomains);
+    const sidebarNav = normalizeSidebarNavInput(dto.sidebarNavMore);
 
     const data: Prisma.TenantSettingsUpdateInput = {};
     if (dto.orgName !== undefined) data.orgName = dto.orgName;
@@ -88,13 +110,13 @@ export class SettingsService {
     if (dto.invoicePrefix !== undefined) data.invoicePrefix = dto.invoicePrefix;
     if (dto.themeColor !== undefined) data.themeColor = dto.themeColor;
     if (domains !== undefined) data.allowedDomains = domains;
+    if (sidebarNav !== undefined) data.sidebarNav = sidebarNav;
 
     const updated = await this.prisma.tenantSettings.update({
       where: { tenantId },
       data,
     });
 
-    // Keep Tenant row in sync for switcher / auth payloads
     const tenantPatch: {
       name?: string;
       logo?: string | null;
@@ -127,6 +149,7 @@ export class SettingsService {
         invoicePrefix: old.invoicePrefix,
         themeColor: old.themeColor,
         allowedDomains: old.allowedDomains,
+        sidebarNav: old.sidebarNav,
       },
       newValue: dto as unknown as Record<string, unknown>,
     });
@@ -162,7 +185,8 @@ export class SettingsService {
     if (!tenant) throw new NotFoundException('Tenant not found');
 
     await this.prisma.$transaction([
-      this.prisma.userSession.deleteMany({ where: { tenantId } }),
+      this.prisma.userRole.deleteMany({ where: { tenantId } }),
+      this.prisma.tenantMember.deleteMany({ where: { tenantId } }),
       this.prisma.tenant.update({
         where: { id: tenantId },
         data: { deletedAt: new Date() },

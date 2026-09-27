@@ -55,6 +55,13 @@ function ageDaysFromLedger(
   entries: Array<{ amount: DecimalLike; createdAt: Date }>,
   now: Date,
 ): number | null {
+  const oldest = oldestOpenDebitAt(entries);
+  if (!oldest) return null;
+  return daysBetween(oldest, now);
+}
+
+/** CreatedAt of the oldest still-open debit (after applying credits FIFO). */
+function oldestOpenDebitAt(entries: Array<{ amount: DecimalLike; createdAt: Date }>): Date | null {
   const open: Array<{ remaining: number; createdAt: Date }> = [];
   for (const entry of entries) {
     const amount = decimalToNumber(entry.amount);
@@ -73,8 +80,7 @@ function ageDaysFromLedger(
       }
     }
   }
-  if (open.length === 0) return null;
-  return daysBetween(open[0].createdAt, now);
+  return open.length === 0 ? null : open[0].createdAt;
 }
 
 const paymentInclude = {
@@ -515,7 +521,12 @@ export class PaymentsService {
       if (!isCod && cycleLast) {
         const pastDue = today.getTime() > cycleLast.getTime();
         const unpaidSinceDue = !lastPay || startOfDay(lastPay).getTime() < cycleLast.getTime();
-        if (pastDue && unpaidSinceDue) {
+        // Don't flag cycle overdue if open balance only appeared AFTER that due date
+        // (e.g. opening receivable entered today against a monthly due day earlier this month).
+        const openSince = oldestOpenDebitAt(ledgerByCustomer.get(c.id) ?? []);
+        const balancePredatesDue =
+          !!openSince && startOfDay(openSince).getTime() <= cycleLast.getTime();
+        if (pastDue && unpaidSinceDue && balancePredatesDue) {
           row.dueDate = cycleLast.toISOString().slice(0, 10);
           row.daysOverdue = daysBetween(cycleLast, now);
           overdue.push(row);

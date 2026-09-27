@@ -179,6 +179,24 @@ const STARTER_FEATURE_FLAGS = [
     isGlobal: true,
     isActive: true,
   },
+  {
+    name: 'Pack Helpers',
+    slug: 'pack-helpers',
+    description:
+      'Carton/crate input helpers (pack label + units per pack). Delivery can enter packs + loose; system stores base-unit qty. Disable for tenants that sell only by kg/litre/piece without cartons.',
+    // Global default ON so bottled/water tenants keep pack UI; SA disables for rice-only tenants.
+    isGlobal: true,
+    isActive: true,
+  },
+  {
+    name: 'Plant Fill Log',
+    slug: 'plant-fill',
+    description:
+      'Log plant fills (cans filled + fill cost per batch) and load opening stock from refill batches on delivery runs. Disable for tenants that do not fill at a plant.',
+    // Global default ON so water/plant tenants keep current behaviour; SA disables for non-plant tenants.
+    isGlobal: true,
+    isActive: true,
+  },
 ];
 
 // ─── Helpers ──────────────────────────────────────────────────

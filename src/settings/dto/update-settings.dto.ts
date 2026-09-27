@@ -7,7 +7,9 @@ import {
   IsArray,
   ArrayMaxSize,
   ValidateIf,
+  IsIn,
 } from 'class-validator';
+import { SIDEBAR_NAV_KEYS } from '../../common/helpers/sidebar-nav.helper';
 
 export class UpdateSettingsDto {
   @ApiPropertyOptional({ example: 'Acme Corp' })
@@ -79,4 +81,17 @@ export class UpdateSettingsDto {
   @IsString({ each: true })
   @MaxLength(100, { each: true })
   allowedDomains?: string[];
+
+  @ApiPropertyOptional({
+    example: ['products', 'vehicles', 'riders', 'users', 'roles'],
+    description:
+      'Nav keys to show under sidebar More. Empty array = all tabs primary. No server defaults.',
+    type: [String],
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(SIDEBAR_NAV_KEYS.length)
+  @IsString({ each: true })
+  @IsIn([...SIDEBAR_NAV_KEYS], { each: true })
+  sidebarNavMore?: string[];
 }

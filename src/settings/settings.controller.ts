@@ -54,6 +54,12 @@ export class SettingsController {
     return this.platformSettings.update(dto, user.id);
   }
 
+  /** Any workspace member — drives sidebar Primary / More (not settings:read). */
+  @Get('sidebar-nav')
+  getSidebarNav(@CurrentTenant() tenantId: string) {
+    return this.settingsService.getSidebarNav(tenantId);
+  }
+
   @Get()
   @RequirePermissions('settings:read')
   get(@CurrentTenant() tenantId: string) {

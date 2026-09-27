@@ -120,12 +120,13 @@ export class CustomersController {
 
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
-  @RequirePermissions('customers:delete')
+  @RequirePermissions('customers:update')
   remove(
     @Param('id') id: string,
     @CurrentTenant() tenantId: string,
     @CurrentUser() user: AuthenticatedUser,
   ) {
+    // Legacy DELETE → deactivate (no soft-delete). Prefer PATCH status=INACTIVE.
     return this.customersService.softDelete(id, tenantId, user.id);
   }
 }

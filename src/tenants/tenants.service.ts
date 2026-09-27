@@ -48,14 +48,30 @@ type TenantDetail = TenantListItem & {
     email: string;
     firstName: string;
     lastName: string;
+    phone: string | null;
     memberStatus: string;
     emailVerified: boolean;
     emailVerifiedAt: Date | null;
   } | null;
+  featureFlags: Array<{
+    id: string;
+    name: string;
+    slug: string;
+    description: string | null;
+    isGlobal: boolean;
+    tenantEnabled: boolean | null;
+    effectivelyEnabled: boolean;
+  }>;
 };
 
 type TenantCreateResult = TenantListItem & {
-  owner: { id: string; email: string; firstName: string; lastName: string };
+  owner: {
+    id: string;
+    email: string;
+    firstName: string;
+    lastName: string;
+    phone: string | null;
+  };
 };
 
 @Injectable()
@@ -121,11 +137,16 @@ export class TenantsService {
           email: ownerEmail,
           firstName: dto.ownerFirstName.trim(),
           lastName: dto.ownerLastName.trim(),
+          phone: dto.ownerPhone?.trim() || undefined,
           roleIds: [ownerRole.id],
         },
         tenant.id,
         actorId,
       );
+
+      if (dto.featureFlags?.length) {
+        await this.applyFeatureFlags(tenant.id, dto.featureFlags, actorId);
+      }
 
       const updated = await this.prisma.tenant.update({
         where: { id: tenant.id },
@@ -143,7 +164,14 @@ export class TenantsService {
           ...updated,
           ownerEmail: owner.email,
           ownerId: owner.id,
+          ownerPhone: dto.ownerPhone ?? null,
+          featureFlags: dto.featureFlags ?? [],
         },
+      });
+
+      const ownerUser = await this.prisma.user.findUnique({
+        where: { id: owner.id },
+        select: { phone: true },
       });
 
       return {
@@ -153,10 +181,12 @@ export class TenantsService {
           email: owner.email,
           firstName: owner.firstName,
           lastName: owner.lastName,
+          phone: ownerUser?.phone ?? null,
         },
       };
     } catch (err) {
       // Roll back orphan tenant if owner invite fails
+      await this.prisma.tenantFeature.deleteMany({ where: { tenantId: tenant.id } });
       await this.prisma.tenantSettings.deleteMany({ where: { tenantId: tenant.id } });
       await this.prisma.tenantMember.deleteMany({ where: { tenantId: tenant.id } });
       await this.prisma.userRole.deleteMany({ where: { tenantId: tenant.id } });
@@ -254,6 +284,7 @@ export class TenantsService {
           email: true,
           firstName: true,
           lastName: true,
+          phone: true,
           emailVerified: true,
           emailVerifiedAt: true,
         },
@@ -270,6 +301,7 @@ export class TenantsService {
           email: ownerUser.email,
           firstName: ownerUser.firstName,
           lastName: ownerUser.lastName,
+          phone: ownerUser.phone,
           memberStatus: membership?.status ?? 'UNKNOWN',
           emailVerified: ownerUser.emailVerified,
           emailVerifiedAt: ownerUser.emailVerifiedAt,
@@ -277,7 +309,9 @@ export class TenantsService {
       }
     }
 
-    return { ...(tenant as Omit<TenantDetail, 'owner'>), owner };
+    const featureFlags = await this.listFeatureFlagsForTenant(id);
+
+    return { ...(tenant as Omit<TenantDetail, 'owner' | 'featureFlags'>), owner, featureFlags };
   }
 
   /**
@@ -511,6 +545,71 @@ export class TenantsService {
       select: { id: true },
     });
     if (existing) throw new ConflictException(`Subdomain "${subdomain}" is already taken`);
+  }
+
+  private async applyFeatureFlags(
+    tenantId: string,
+    flags: Array<{ slug: string; enabled: boolean }>,
+    actorId: string,
+  ): Promise<void> {
+    const slugs = [...new Set(flags.map((f) => f.slug.trim()).filter(Boolean))];
+    if (slugs.length === 0) return;
+
+    const catalog = await this.prisma.featureFlag.findMany({
+      where: { slug: { in: slugs }, isActive: true },
+      select: { id: true, slug: true },
+    });
+    const bySlug = new Map(catalog.map((f) => [f.slug, f.id]));
+
+    const unknown = slugs.filter((s) => !bySlug.has(s));
+    if (unknown.length > 0) {
+      throw new BadRequestException(`Unknown or inactive feature flag(s): ${unknown.join(', ')}`);
+    }
+
+    for (const item of flags) {
+      const featureFlagId = bySlug.get(item.slug.trim());
+      if (!featureFlagId) continue;
+      await this.prisma.tenantFeature.upsert({
+        where: { tenantId_featureFlagId: { tenantId, featureFlagId } },
+        update: { isEnabled: item.enabled },
+        create: { tenantId, featureFlagId, isEnabled: item.enabled },
+      });
+    }
+
+    await this.auditLogs.write({
+      actorId,
+      tenantId,
+      action: 'CREATE',
+      module: 'feature-flags',
+      entityId: tenantId,
+      newValue: { type: 'tenant-create-overrides', flags },
+    });
+  }
+
+  private async listFeatureFlagsForTenant(tenantId: string): Promise<TenantDetail['featureFlags']> {
+    const flags = await this.prisma.featureFlag.findMany({
+      where: { isActive: true },
+      include: {
+        tenantFeatures: {
+          where: { tenantId },
+          select: { isEnabled: true },
+        },
+      },
+      orderBy: { name: 'asc' },
+    });
+
+    return flags.map((f) => {
+      const override = f.tenantFeatures[0]?.isEnabled ?? null;
+      return {
+        id: f.id,
+        name: f.name,
+        slug: f.slug,
+        description: f.description,
+        isGlobal: f.isGlobal,
+        tenantEnabled: override,
+        effectivelyEnabled: override !== null ? override : f.isGlobal,
+      };
+    });
   }
 
   private listSelect() {

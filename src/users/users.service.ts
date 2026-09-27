@@ -164,6 +164,7 @@ export class UsersService {
           deletedAt: null,
           firstName: dto.firstName,
           lastName: dto.lastName,
+          ...(dto.phone !== undefined ? { phone: dto.phone?.trim() || null } : {}),
         },
       });
 
@@ -230,6 +231,13 @@ export class UsersService {
 
       // Existing user who never finished invite / set password → invite link, not join mail
       if (!existingUser.emailVerified) {
+        if (dto.phone !== undefined) {
+          await this.prisma.user.update({
+            where: { id: existingUser.id },
+            data: { phone: dto.phone?.trim() || null },
+          });
+        }
+
         await this.prisma.tenantMember.create({
           data: {
             userId: existingUser.id,
@@ -278,6 +286,13 @@ export class UsersService {
       }
 
       // Existing verified user — enroll immediately (they already have a password)
+      if (dto.phone !== undefined) {
+        await this.prisma.user.update({
+          where: { id: existingUser.id },
+          data: { phone: dto.phone?.trim() || null },
+        });
+      }
+
       await this.prisma.tenantMember.create({
         data: {
           userId: existingUser.id,
@@ -326,6 +341,7 @@ export class UsersService {
         email,
         firstName: dto.firstName,
         lastName: dto.lastName,
+        phone: dto.phone?.trim() || null,
         passwordHash: placeholderHash,
       },
     });

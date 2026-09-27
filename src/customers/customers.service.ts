@@ -270,6 +270,10 @@ export class CustomersService {
   async update(id: string, tenantId: string, dto: UpdateCustomerDto, actorId: string) {
     const existing = await this.findActiveOrThrow(id, tenantId);
 
+    if (dto.status === CustomerStatus.INACTIVE && existing.status !== CustomerStatus.INACTIVE) {
+      await this.assertCanDeactivate(tenantId, id);
+    }
+
     if (dto.areaId !== undefined || dto.areaName !== undefined) {
       this.assertAreaInput(dto.areaId, dto.areaName, true);
     }
@@ -488,25 +492,71 @@ export class CustomersService {
     return this.containerBalance(id, tenantId);
   }
 
+  /**
+   * Deactivate only — no hard/soft delete. Blocked when dues or containers remain.
+   */
   async softDelete(id: string, tenantId: string, actorId: string): Promise<void> {
     const existing = await this.findActiveOrThrow(id, tenantId);
+    if (existing.status === CustomerStatus.INACTIVE) {
+      return;
+    }
+    await this.assertCanDeactivate(tenantId, id);
     await this.prisma.customer.update({
       where: { id },
-      data: {
-        deletedAt: new Date(),
-        status: CustomerStatus.INACTIVE,
-        name: `${existing.name}_deleted_${Date.now()}`,
-      },
+      data: { status: CustomerStatus.INACTIVE },
     });
     await this.audit.write({
       tenantId,
       actorId,
       module: 'customers',
-      action: 'DELETE',
+      action: 'UPDATE',
       entityId: id,
-      oldValue: { name: existing.name },
-      newValue: { deletedAt: new Date().toISOString() },
+      oldValue: { status: existing.status },
+      newValue: { status: CustomerStatus.INACTIVE, via: 'deactivate' },
     });
+  }
+
+  /**
+   * Outstanding ledger balance or any non-zero container qty with customer blocks deactivate.
+   */
+  private async assertCanDeactivate(tenantId: string, customerId: string): Promise<void> {
+    const [ledgerAgg, movements] = await Promise.all([
+      this.prisma.customerLedgerEntry.aggregate({
+        where: { tenantId, customerId },
+        _sum: { amount: true },
+      }),
+      this.prisma.containerMovement.findMany({
+        where: { tenantId, customerId },
+        select: { productId: true, movementType: true, quantity: true },
+      }),
+    ]);
+
+    const balance = Math.round(decimalToNumber(ledgerAgg._sum.amount) * 100) / 100;
+    const cansByProduct = new Map<string, number>();
+    for (const m of movements) {
+      cansByProduct.set(
+        m.productId,
+        (cansByProduct.get(m.productId) ?? 0) +
+          customerContainerSignedQty(m.movementType, m.quantity),
+      );
+    }
+    let cansWithCustomer = 0;
+    for (const qty of cansByProduct.values()) {
+      if (qty > 0) cansWithCustomer += qty;
+    }
+
+    const parts: string[] = [];
+    if (Math.abs(balance) >= 0.01) {
+      parts.push(`outstanding balance ${balance.toFixed(2)}`);
+    }
+    if (cansWithCustomer > 0) {
+      parts.push(`${cansWithCustomer} container(s) still with customer`);
+    }
+    if (parts.length > 0) {
+      throw new BadRequestException(
+        `Cannot deactivate: ${parts.join(' and ')}. Clear dues and recover containers first.`,
+      );
+    }
   }
 
   async ledger(id: string, tenantId: string, query: ListCustomerLedgerQueryDto) {

@@ -1,7 +1,7 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import {
   ContainerMovementType as PrismaContainerMovementType,
-  Prisma,
+  DeliveryStatus as PrismaDeliveryStatus,
   RunStatus as PrismaRunStatus,
   StockType as PrismaStockType,
 } from '@prisma/client';
@@ -18,11 +18,6 @@ import {
 import { SetContainerOpeningDto } from './dto/set-container-opening.dto';
 import { AdjustOwnedContainersDto } from './dto/adjust-owned-containers.dto';
 
-function decimalToNumber(value: Prisma.Decimal | number | null | undefined): number {
-  if (value == null) return 0;
-  return typeof value === 'number' ? value : Number(value.toString());
-}
-
 @Injectable()
 export class ContainerInventoryService {
   constructor(
@@ -37,7 +32,7 @@ export class ContainerInventoryService {
 
     const products = await this.prisma.product.findMany({
       where: { tenantId, deletedAt: null, isReturnable: true },
-      select: { id: true, name: true },
+      select: { id: true, name: true, baseUnit: true, containerCapacity: true },
       orderBy: { name: 'asc' },
     });
     if (products.length === 0) return [];
@@ -50,53 +45,76 @@ export class ContainerInventoryService {
     });
     const openRunIds = openRuns.map((run) => run.id);
 
-    const [ownedMovements, customerMovements, vehicleStock] = await Promise.all([
-      this.prisma.containerMovement.findMany({
-        where: {
-          tenantId,
-          productId: { in: productIds },
-          customerId: null,
-          vehicleId: null,
-          movementType: {
-            in: [
-              PrismaContainerMovementType.OPENING_ON_HAND,
-              PrismaContainerMovementType.ADJUSTMENT,
-              PrismaContainerMovementType.LOST,
-              PrismaContainerMovementType.DAMAGED,
-            ],
-          },
-        },
-        select: { productId: true, movementType: true, quantity: true },
-      }),
-      this.prisma.containerMovement.findMany({
-        where: {
-          tenantId,
-          productId: { in: productIds },
-          customerId: { not: null },
-        },
-        select: {
-          productId: true,
-          customerId: true,
-          movementType: true,
-          quantity: true,
-          customer: { select: { id: true, name: true, deletedAt: true } },
-        },
-      }),
-      openRunIds.length === 0
-        ? Promise.resolve(
-            [] as Array<{ productId: string; _sum: { filledCount: Prisma.Decimal | null } }>,
-          )
-        : this.prisma.deliveryRunStock.groupBy({
-            by: ['productId'],
-            where: {
-              tenantId,
-              stockType: PrismaStockType.OPENING,
-              productId: { in: productIds },
-              deliveryRunId: { in: openRunIds },
+    const [ownedMovements, customerMovements, vehicleStock, deliveredOnOpenRuns] =
+      await Promise.all([
+        this.prisma.containerMovement.findMany({
+          where: {
+            tenantId,
+            productId: { in: productIds },
+            customerId: null,
+            vehicleId: null,
+            movementType: {
+              in: [
+                PrismaContainerMovementType.OPENING_ON_HAND,
+                PrismaContainerMovementType.ADJUSTMENT,
+                PrismaContainerMovementType.LOST,
+                PrismaContainerMovementType.DAMAGED,
+              ],
             },
-            _sum: { filledCount: true },
-          }),
-    ]);
+          },
+          select: { productId: true, movementType: true, quantity: true },
+        }),
+        this.prisma.containerMovement.findMany({
+          where: {
+            tenantId,
+            productId: { in: productIds },
+            customerId: { not: null },
+          },
+          select: {
+            productId: true,
+            customerId: true,
+            movementType: true,
+            quantity: true,
+            customer: { select: { id: true, name: true, deletedAt: true } },
+          },
+        }),
+        openRunIds.length === 0
+          ? Promise.resolve(
+              [] as Array<{
+                productId: string;
+                filledPackagingCount: number;
+              }>,
+            )
+          : this.prisma.deliveryRunStock.findMany({
+              where: {
+                tenantId,
+                stockType: PrismaStockType.OPENING,
+                productId: { in: productIds },
+                deliveryRunId: { in: openRunIds },
+              },
+              select: { productId: true, filledPackagingCount: true },
+            }),
+        openRunIds.length === 0
+          ? Promise.resolve(
+              [] as Array<{
+                productId: string;
+                containersDelivered: number;
+              }>,
+            )
+          : this.prisma.deliveryItem.findMany({
+              where: {
+                tenantId,
+                productId: { in: productIds },
+                containersDelivered: { gt: 0 },
+                delivery: {
+                  tenantId,
+                  deliveryRunId: { in: openRunIds },
+                  status: { not: PrismaDeliveryStatus.CANCELLED },
+                },
+              },
+              select: { productId: true, containersDelivered: true },
+            }),
+      ]);
 
     const ownedByProduct = new Map<string, number>();
     const hasOpeningByProduct = new Map<string, boolean>();
@@ -140,7 +158,16 @@ export class ContainerInventoryService {
 
     const onVehiclesByProduct = new Map<string, number>();
     for (const row of vehicleStock) {
-      onVehiclesByProduct.set(row.productId, decimalToNumber(row._sum.filledCount));
+      onVehiclesByProduct.set(
+        row.productId,
+        (onVehiclesByProduct.get(row.productId) ?? 0) + row.filledPackagingCount,
+      );
+    }
+    for (const row of deliveredOnOpenRuns) {
+      onVehiclesByProduct.set(
+        row.productId,
+        (onVehiclesByProduct.get(row.productId) ?? 0) - row.containersDelivered,
+      );
     }
 
     return products.map((product) => {

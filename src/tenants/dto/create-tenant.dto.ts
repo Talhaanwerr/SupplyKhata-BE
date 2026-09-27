@@ -4,11 +4,14 @@ import {
   IsNotEmpty,
   IsOptional,
   IsEmail,
+  IsArray,
   Matches,
   MaxLength,
   MinLength,
+  ValidateNested,
 } from 'class-validator';
-import { Transform } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
+import { TenantFeatureFlagInputDto } from './tenant-feature-flag-input.dto';
 
 export class CreateTenantDto {
   @ApiProperty({ example: 'Acme Corp' })
@@ -19,7 +22,7 @@ export class CreateTenantDto {
 
   @ApiProperty({
     example: 'acme-corp',
-    description: 'URL-safe slug, lowercase letters, digits, hyphens',
+    description: 'URL-safe slug, lowercase letters, digits, and hyphens',
   })
   @IsString()
   @IsNotEmpty()
@@ -94,4 +97,24 @@ export class CreateTenantDto {
   @IsNotEmpty()
   @MaxLength(80)
   ownerLastName!: string;
+
+  @ApiPropertyOptional({ example: '+923001234567' })
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string' && value.trim() === '' ? undefined : value,
+  )
+  @IsOptional()
+  @IsString()
+  @MaxLength(30)
+  ownerPhone?: string;
+
+  /**
+   * Optional feature overrides at create time.
+   * Each entry writes a TenantFeature row (enable/disable for this workspace).
+   */
+  @ApiPropertyOptional({ type: [TenantFeatureFlagInputDto] })
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => TenantFeatureFlagInputDto)
+  featureFlags?: TenantFeatureFlagInputDto[];
 }

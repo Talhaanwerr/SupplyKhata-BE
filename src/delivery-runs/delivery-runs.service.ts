@@ -17,6 +17,14 @@ import { ListDeliveryRunsQueryDto } from './dto/list-delivery-runs-query.dto';
 import { DeliveryRunStockDto } from './dto/delivery-run-stock.dto';
 import { DeliveryRunRefillLoadDto } from './dto/delivery-run-refill-load.dto';
 import { assertValidStockQuantity, decimalQtyToNumber } from '../common/helpers/product-qty.helper';
+import {
+  assertNoRefillLoadsWhenPlantFillDisabled,
+  isPlantFillEnabled,
+} from '../common/helpers/plant-fill.helper';
+import {
+  isReturnableContainersEnabled,
+  resolveFilledPackagingCount,
+} from '../common/helpers/returnable-containers.helper';
 
 type DecimalLike = Prisma.Decimal | number | null | undefined;
 
@@ -50,6 +58,8 @@ export class DeliveryRunsService {
     this.assertUniqueProducts(dto.openingStock);
     const date = parseDate(dto.date);
     const refillLoads = dto.refillLoads ?? [];
+    const plantFillEnabled = await isPlantFillEnabled(this.prisma, tenantId);
+    assertNoRefillLoadsWhenPlantFillDisabled(plantFillEnabled, refillLoads);
     const productIds = [
       ...new Set([
         ...dto.openingStock.map((stock) => stock.productId),
@@ -63,16 +73,19 @@ export class DeliveryRunsService {
       this.assertVehicle(this.prisma, tenantId, dto.vehicleId),
       this.assertProducts(this.prisma, tenantId, productIds),
     ]);
-    await this.assertStockQuantities(this.prisma, tenantId, dto.openingStock);
+    // stock qty + packaging validated when resolving packaging counts below
 
     const runId = await this.prisma.$transaction(
       async (tx) => {
         // Re-check remaining inside the tx so concurrent loads cannot overdraw.
-        const filledFromLoads = await this.resolveRefillLoads(tx, tenantId, refillLoads);
-        const openingStock = this.mergeOpeningStockWithRefillLoads(
+        const filledFromLoads = plantFillEnabled
+          ? await this.resolveRefillLoads(tx, tenantId, refillLoads)
+          : new Map<string, number>();
+        const openingStockMerged = this.mergeOpeningStockWithRefillLoads(
           dto.openingStock,
           filledFromLoads,
         );
+        const openingStock = await this.withPackagingCounts(tx, tenantId, openingStockMerged);
 
         const created = await tx.deliveryRun.create({
           data: {
@@ -88,6 +101,7 @@ export class DeliveryRunsService {
                 productId: stock.productId,
                 stockType: PrismaStockType.OPENING,
                 filledCount: stock.filledCount,
+                filledPackagingCount: stock.filledPackagingCount,
                 emptyCount: stock.emptyCount,
               })),
             },
@@ -205,10 +219,10 @@ export class DeliveryRunsService {
           tenantId,
           dto.openingStock.map((stock) => stock.productId),
         );
-        await this.assertStockQuantities(tx, tenantId, dto.openingStock);
-        await this.assertOpeningStockNotBelowDelivered(tx, tenantId, id, dto.openingStock);
+        const openingStock = await this.withPackagingCounts(tx, tenantId, dto.openingStock);
+        await this.assertOpeningStockNotBelowDelivered(tx, tenantId, id, openingStock);
 
-        for (const stock of dto.openingStock) {
+        for (const stock of openingStock) {
           await tx.deliveryRunStock.upsert({
             where: {
               deliveryRunId_productId_stockType: {
@@ -223,10 +237,12 @@ export class DeliveryRunsService {
               productId: stock.productId,
               stockType: PrismaStockType.OPENING,
               filledCount: stock.filledCount,
+              filledPackagingCount: stock.filledPackagingCount,
               emptyCount: stock.emptyCount,
             },
             update: {
               filledCount: stock.filledCount,
+              filledPackagingCount: stock.filledPackagingCount,
               emptyCount: stock.emptyCount,
             },
           });
@@ -281,17 +297,18 @@ export class DeliveryRunsService {
         tenantId,
         dto.closingStock.map((stock) => stock.productId),
       );
-      await this.assertStockQuantities(tx, tenantId, dto.closingStock);
+      const closingStock = await this.withPackagingCounts(tx, tenantId, dto.closingStock);
 
       const totals = await this.computeTotals(tx, tenantId, id);
 
       await tx.deliveryRunStock.createMany({
-        data: dto.closingStock.map((stock) => ({
+        data: closingStock.map((stock) => ({
           tenantId,
           deliveryRunId: id,
           productId: stock.productId,
           stockType: PrismaStockType.CLOSING,
           filledCount: stock.filledCount,
+          filledPackagingCount: stock.filledPackagingCount,
           emptyCount: stock.emptyCount,
         })),
       });
@@ -344,10 +361,13 @@ export class DeliveryRunsService {
         productId: string;
         productName: string;
         openingFilled: number;
+        openingPackaging: number;
         openingEmpty: number;
         closingFilled: number;
+        closingPackaging: number;
         closingEmpty: number;
         delivered: number;
+        containersDelivered: number;
         emptiesReturned: number;
       }
     >();
@@ -359,10 +379,13 @@ export class DeliveryRunsService {
         productId,
         productName,
         openingFilled: 0,
+        openingPackaging: 0,
         openingEmpty: 0,
         closingFilled: 0,
+        closingPackaging: 0,
         closingEmpty: 0,
         delivered: 0,
+        containersDelivered: 0,
         emptiesReturned: 0,
       };
       products.set(productId, created);
@@ -373,9 +396,11 @@ export class DeliveryRunsService {
       const row = ensure(stock.productId, stock.product.name);
       if (stock.stockType === PrismaStockType.OPENING) {
         row.openingFilled += decimalQtyToNumber(stock.filledCount);
+        row.openingPackaging += stock.filledPackagingCount;
         row.openingEmpty += stock.emptyCount;
       } else {
         row.closingFilled += decimalQtyToNumber(stock.filledCount);
+        row.closingPackaging += stock.filledPackagingCount;
         row.closingEmpty += stock.emptyCount;
       }
     }
@@ -384,6 +409,7 @@ export class DeliveryRunsService {
       for (const item of delivery.items) {
         const row = ensure(item.productId, item.product.name);
         row.delivered += decimalQtyToNumber(item.quantityDelivered);
+        row.containersDelivered += item.containersDelivered;
         row.emptiesReturned += item.emptiesReceived;
       }
     }
@@ -391,12 +417,20 @@ export class DeliveryRunsService {
     const productDiscrepancies = [...products.values()].map((row) => {
       const expectedClosingFilled = row.openingFilled - row.delivered;
       const expectedClosingEmpty = row.openingEmpty + row.emptiesReturned;
+      const expectedClosingPackaging = row.openingPackaging - row.containersDelivered;
       const filledDifference = row.closingFilled - expectedClosingFilled;
       const emptyDifference = row.closingEmpty - expectedClosingEmpty;
       const missingContainers =
-        expectedClosingFilled + expectedClosingEmpty - row.closingFilled - row.closingEmpty;
+        expectedClosingPackaging + expectedClosingEmpty - row.closingPackaging - row.closingEmpty;
       return {
-        ...row,
+        productId: row.productId,
+        productName: row.productName,
+        openingFilled: row.openingFilled,
+        openingEmpty: row.openingEmpty,
+        closingFilled: row.closingFilled,
+        closingEmpty: row.closingEmpty,
+        delivered: row.delivered,
+        emptiesReturned: row.emptiesReturned,
         expectedClosingFilled,
         expectedClosingEmpty,
         filledDifference,
@@ -493,29 +527,55 @@ export class DeliveryRunsService {
     }
   }
 
-  private async assertStockQuantities(
+  /**
+   * Validate base qty + empties, resolve filledPackagingCount (explicit for LTR/KG returnable).
+   */
+  private async withPackagingCounts(
     tx: Prisma.TransactionClient | PrismaService,
     tenantId: string,
     stock: DeliveryRunStockDto[],
-  ) {
-    if (stock.length === 0) return;
+  ): Promise<Array<DeliveryRunStockDto & { filledPackagingCount: number }>> {
+    if (stock.length === 0) return [];
+
+    const containersEnabled = await isReturnableContainersEnabled(tx, tenantId);
     const products = await tx.product.findMany({
       where: {
         tenantId,
         id: { in: stock.map((s) => s.productId) },
         deletedAt: null,
       },
-      select: { id: true, name: true, allowFractionalQty: true },
+      select: {
+        id: true,
+        name: true,
+        allowFractionalQty: true,
+        baseUnit: true,
+        isReturnable: true,
+        containerCapacity: true,
+      },
     });
     const byId = new Map(products.map((p) => [p.id, p]));
-    for (const row of stock) {
+
+    return stock.map((row) => {
       const product = byId.get(row.productId);
-      if (!product) continue;
+      if (!product) {
+        throw new BadRequestException('One or more products are invalid for this workspace');
+      }
       assertValidStockQuantity(row.filledCount, product, 'units loaded');
       if (!Number.isInteger(row.emptyCount)) {
         throw new BadRequestException(`Empty count for "${product.name}" must be a whole number`);
       }
-    }
+
+      const trackContainers = containersEnabled && product.isReturnable;
+      const filledPackagingCount = trackContainers
+        ? resolveFilledPackagingCount(product, row.filledCount, row.filledPackagingCount)
+        : 0;
+
+      return {
+        ...row,
+        emptyCount: trackContainers ? row.emptyCount : 0,
+        filledPackagingCount,
+      };
+    });
   }
 
   private assertUniqueProducts(stock: DeliveryRunStockDto[]): void {
@@ -601,7 +661,7 @@ export class DeliveryRunsService {
     tx: Prisma.TransactionClient,
     tenantId: string,
     deliveryRunId: string,
-    openingStock: DeliveryRunStockDto[],
+    openingStock: Array<DeliveryRunStockDto & { filledPackagingCount: number }>,
   ): Promise<void> {
     const productIds = openingStock.map((row) => row.productId);
     const [products, deliveries] = await Promise.all([
@@ -618,13 +678,18 @@ export class DeliveryRunsService {
         select: {
           items: {
             where: { productId: { in: productIds } },
-            select: { productId: true, quantityDelivered: true },
+            select: {
+              productId: true,
+              quantityDelivered: true,
+              containersDelivered: true,
+            },
           },
         },
       }),
     ]);
     const nameById = new Map(products.map((product) => [product.id, product.name]));
     const deliveredByProduct = new Map<string, number>();
+    const cansDeliveredByProduct = new Map<string, number>();
     for (const delivery of deliveries) {
       for (const item of delivery.items) {
         deliveredByProduct.set(
@@ -632,15 +697,25 @@ export class DeliveryRunsService {
           (deliveredByProduct.get(item.productId) ?? 0) +
             decimalQtyToNumber(item.quantityDelivered),
         );
+        cansDeliveredByProduct.set(
+          item.productId,
+          (cansDeliveredByProduct.get(item.productId) ?? 0) + item.containersDelivered,
+        );
       }
     }
 
     for (const stock of openingStock) {
+      const name = nameById.get(stock.productId) ?? 'product';
       const delivered = deliveredByProduct.get(stock.productId) ?? 0;
       if (stock.filledCount + 1e-9 < delivered) {
-        const name = nameById.get(stock.productId) ?? 'product';
         throw new BadRequestException(
           `Opening filled for "${name}" cannot be below already delivered qty (${delivered})`,
+        );
+      }
+      const cansDelivered = cansDeliveredByProduct.get(stock.productId) ?? 0;
+      if (stock.filledPackagingCount < cansDelivered) {
+        throw new BadRequestException(
+          `Opening cans for "${name}" cannot be below already delivered cans (${cansDelivered})`,
         );
       }
     }
@@ -741,6 +816,7 @@ export class DeliveryRunsService {
         productId: stock.productId,
         stockType: stock.stockType as StockType,
         filledCount: decimalQtyToNumber(stock.filledCount),
+        filledPackagingCount: stock.filledPackagingCount,
         emptyCount: stock.emptyCount,
         product: stock.product,
       })),
@@ -763,13 +839,15 @@ export class DeliveryRunsService {
           productId: item.productId,
           product: item.product,
           quantityDelivered: decimalQtyToNumber(item.quantityDelivered),
+          containersDelivered: item.containersDelivered,
           emptiesReceived: item.emptiesReceived,
           sellingPriceSnapshot: decimalToNumber(item.sellingPriceSnapshot),
           unitCostSnapshot: decimalToNumber(item.unitCostSnapshot),
           lineTotal: decimalToNumber(item.lineTotal),
         }));
         const activeItems = items.filter(
-          (item) => item.quantityDelivered > 0 || item.emptiesReceived > 0,
+          (item) =>
+            item.quantityDelivered > 0 || item.containersDelivered > 0 || item.emptiesReceived > 0,
         );
         const totalSale = items.reduce((sum, item) => sum + item.lineTotal, 0);
         return {
@@ -790,10 +868,11 @@ export class DeliveryRunsService {
             delivery.promisedAmount == null ? null : decimalToNumber(delivery.promisedAmount),
           totalSale,
           productsSummary: activeItems
-            .map(
-              (item) =>
-                `${item.product.name} (${item.quantityDelivered} del / ${item.emptiesReceived} empty)`,
-            )
+            .map((item) => {
+              const cans =
+                item.containersDelivered > 0 ? ` / ${item.containersDelivered} cans` : '';
+              return `${item.product.name} (${item.quantityDelivered} del${cans} / ${item.emptiesReceived} empty)`;
+            })
             .join(', '),
           items,
           createdAt: delivery.createdAt,

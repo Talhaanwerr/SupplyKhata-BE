@@ -19,6 +19,12 @@ export class InviteUserDto {
   @MaxLength(80)
   lastName!: string;
 
+  @ApiPropertyOptional({ example: '+923001234567' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(30)
+  phone?: string;
+
   @ApiPropertyOptional({
     example: ['role-cuid-1'],
     type: [String],

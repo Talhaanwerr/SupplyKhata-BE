@@ -202,6 +202,7 @@ model User {
   email           String    @unique
   firstName       String
   lastName        String
+  phone           String?
   passwordHash    String
   isSuperAdmin    Boolean   @default(false)
   emailVerified   Boolean   @default(false)
@@ -424,6 +425,8 @@ model TenantSettings {
   themeColor     String  @default("#000000")
   /// Allowed invite email domains, e.g. ["acme.com","partner.org"]. Empty = any domain.
   allowedDomains Json    @default("[]")
+  /// Sidebar layout: { "more": ["products","vehicles",...] }. Empty / missing = all items primary.
+  sidebarNav     Json    @default("{}")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -644,6 +647,8 @@ model DeliveryRunStock {
   stockType     StockType
   /// Units loaded in product baseUnit (cans / litres / kg).
   filledCount   Decimal   @default(0) @db.Decimal(12, 3)
+  /// Whole filled packaging units on vehicle (cans). For PCS equals filledCount; for LTR/KG set explicitly (e.g. 40L in 3 cans → 3).
+  filledPackagingCount Int @default(0)
   /// Whole packaging empties on vehicle (always integer packaging units).
   emptyCount    Int       @default(0)
 
@@ -694,6 +699,8 @@ model DeliveryItem {
   productId            String
   /// Always in product baseUnit (PCS / LTR / KG).
   quantityDelivered    Decimal  @db.Decimal(12, 3)
+  /// Whole packaging units given to customer (cans). For PCS usually = quantity; for LTR/KG set explicitly.
+  containersDelivered  Int      @default(0)
   /// Whole packaging units returned (cans/crates) — not litres/kg.
   emptiesReceived      Int      @default(0)
   sellingPriceSnapshot Decimal  @db.Decimal(10, 2)

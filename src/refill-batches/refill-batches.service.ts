@@ -3,6 +3,7 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditLogsService } from '../audit-logs/audit-logs.service';
 import { getPaginationParams, buildPaginationMeta } from '../common/helpers/pagination.helper';
+import { assertPlantFillEnabled } from '../common/helpers/plant-fill.helper';
 import { PaginatedData } from '../common/types/api-response.type';
 import { CreateRefillBatchDto } from './dto/create-refill-batch.dto';
 import { UpdateRefillBatchDto } from './dto/update-refill-batch.dto';
@@ -47,6 +48,7 @@ export class RefillBatchesService {
   ) {}
 
   async create(tenantId: string, dto: CreateRefillBatchDto, actorId: string) {
+    await assertPlantFillEnabled(this.prisma, tenantId);
     await this.assertProduct(tenantId, dto.productId);
 
     const date = parseDate(dto.date);
@@ -90,6 +92,7 @@ export class RefillBatchesService {
     tenantId: string,
     query: ListRefillBatchesQueryDto,
   ): Promise<PaginatedData<ReturnType<RefillBatchesService['toDetail']>>> {
+    await assertPlantFillEnabled(this.prisma, tenantId);
     const { skip, take } = getPaginationParams(query);
     const where = this.buildWhere(tenantId, query);
 
@@ -111,6 +114,7 @@ export class RefillBatchesService {
   }
 
   async available(tenantId: string, productId?: string) {
+    await assertPlantFillEnabled(this.prisma, tenantId);
     const where: Prisma.RefillBatchWhereInput = { tenantId };
     if (productId) where.productId = productId;
 
@@ -124,6 +128,7 @@ export class RefillBatchesService {
   }
 
   async findOne(id: string, tenantId: string) {
+    await assertPlantFillEnabled(this.prisma, tenantId);
     const batch = await this.prisma.refillBatch.findFirst({
       where: { id, tenantId },
       include: batchInclude,
@@ -133,6 +138,7 @@ export class RefillBatchesService {
   }
 
   async update(id: string, tenantId: string, dto: UpdateRefillBatchDto, actorId: string) {
+    await assertPlantFillEnabled(this.prisma, tenantId);
     const existing = await this.prisma.refillBatch.findFirst({
       where: { id, tenantId },
       include: batchInclude,
@@ -201,6 +207,7 @@ export class RefillBatchesService {
   }
 
   async remove(id: string, tenantId: string, actorId: string) {
+    await assertPlantFillEnabled(this.prisma, tenantId);
     const existing = await this.prisma.refillBatch.findFirst({
       where: { id, tenantId },
       include: { loads: { select: { id: true } } },

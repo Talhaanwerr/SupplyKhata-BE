@@ -55,7 +55,11 @@ export class CreateProductDto {
 
   @ApiPropertyOptional({ example: 12, description: 'Bottles/pieces per pack (CTN/crate helper)' })
   @IsOptional()
-  @ValidateIf((_, o) => o.unitsPerPack != null || (o.packLabel != null && o.packLabel !== ''))
+  // ValidateIf(object, value) — first arg is the DTO, second is this field's value.
+  @ValidateIf(
+    (obj: CreateProductDto) =>
+      obj.unitsPerPack != null || (obj.packLabel != null && obj.packLabel !== ''),
+  )
   @Type(() => Number)
   @IsInt()
   @Min(2)

@@ -33,6 +33,17 @@ export class CreateDeliveryItemDto {
   @IsInt()
   @Min(0)
   emptiesReceived?: number;
+
+  @ApiPropertyOptional({
+    example: 1,
+    description:
+      'Filled cans given to customer. Required for returnable LTR/KG when quantityDelivered > 0.',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  containersDelivered?: number;
 }
 
 export class CreateDeliveryDto {
