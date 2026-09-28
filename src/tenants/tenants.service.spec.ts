@@ -32,10 +32,13 @@ const mockPrisma = {
     findMany: jest.fn(),
     count: jest.fn(),
   },
+  user: { findUnique: jest.fn() },
   role: { findFirst: jest.fn() },
   tenantSettings: { create: jest.fn(), deleteMany: jest.fn() },
+  tenantFeature: { deleteMany: jest.fn() },
   tenantMember: { deleteMany: jest.fn() },
   userRole: { deleteMany: jest.fn() },
+  featureFlag: { findMany: jest.fn() },
 };
 
 const mockAudit = { write: jest.fn() };
@@ -92,6 +95,7 @@ describe('TenantsService', () => {
         ...baseTenant,
         status: TenantStatus.PENDING,
       });
+      mockPrisma.user.findUnique.mockResolvedValue({ phone: null });
 
       const result = await service.create(dto, ACTOR_ID);
       expect(result.slug).toBe('acme');
