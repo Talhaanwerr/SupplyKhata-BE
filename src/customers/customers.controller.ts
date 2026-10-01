@@ -19,6 +19,7 @@ import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { CurrentTenant } from '../common/decorators/current-tenant.decorator';
 import { AuthenticatedUser } from '../auth/types/jwt-payload.type';
 import { CustomersService } from './customers.service';
+import { InvoicesService } from '../invoices/invoices.service';
 import { CreateCustomerDto } from './dto/create-customer.dto';
 import { UpdateCustomerDto } from './dto/update-customer.dto';
 import { ListCustomersQueryDto } from './dto/list-customers-query.dto';
@@ -26,11 +27,15 @@ import { ResolveCustomerPriceQueryDto } from './dto/resolve-price-query.dto';
 import { ListCustomerLedgerQueryDto } from './dto/list-customer-ledger-query.dto';
 import { CustomerStatementQueryDto } from './dto/customer-statement-query.dto';
 import { AdjustCustomerContainersDto } from './dto/adjust-customer-containers.dto';
+import { ListInvoicesQueryDto } from '../invoices/dto/list-invoices-query.dto';
 
 @UseGuards(JwtAuthGuard, TenantGuard, PermissionsGuard)
 @Controller({ path: 'customers', version: '1' })
 export class CustomersController {
-  constructor(private readonly customersService: CustomersService) {}
+  constructor(
+    private readonly customersService: CustomersService,
+    private readonly invoicesService: InvoicesService,
+  ) {}
 
   @Get()
   @RequirePermissions('customers:read')
@@ -46,6 +51,16 @@ export class CustomersController {
     @CurrentUser() user: AuthenticatedUser,
   ) {
     return this.customersService.create(tenantId, dto, user.id);
+  }
+
+  @Get(':id/invoices')
+  @RequirePermissions('invoices:read')
+  invoices(
+    @Param('id') id: string,
+    @Query() query: ListInvoicesQueryDto,
+    @CurrentTenant() tenantId: string,
+  ) {
+    return this.invoicesService.listForCustomer(id, tenantId, query);
   }
 
   @Get(':id/ledger')

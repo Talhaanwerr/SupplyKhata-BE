@@ -5,6 +5,8 @@ export const SIDEBAR_NAV_KEYS = [
   'customers',
   'vehicles',
   'deliveryRuns',
+  'orders',
+  'invoices',
   'refillBatches',
   'expenses',
   'cashHandovers',

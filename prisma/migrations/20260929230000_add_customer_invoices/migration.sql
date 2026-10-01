@@ -1,0 +1,62 @@
+-- Customer invoices (period statements — document only; no ledger posts)
+
+CREATE TABLE `customer_invoices` (
+    `id` VARCHAR(191) NOT NULL,
+    `tenantId` VARCHAR(191) NOT NULL,
+    `customerId` VARCHAR(191) NOT NULL,
+    `invoiceNumber` VARCHAR(191) NULL,
+    `periodStart` DATE NOT NULL,
+    `periodEnd` DATE NOT NULL,
+    `periodType` ENUM('WEEKLY', 'MONTHLY', 'CUSTOM') NOT NULL,
+    `status` ENUM('DRAFT', 'ISSUED', 'VOID') NOT NULL DEFAULT 'DRAFT',
+    `currency` VARCHAR(191) NOT NULL,
+    `openingBalance` DECIMAL(10, 2) NOT NULL,
+    `salesTotal` DECIMAL(10, 2) NOT NULL,
+    `deliveriesTotal` DECIMAL(10, 2) NOT NULL,
+    `ordersTotal` DECIMAL(10, 2) NOT NULL,
+    `paymentsTotal` DECIMAL(10, 2) NOT NULL,
+    `adjustmentsTotal` DECIMAL(10, 2) NOT NULL DEFAULT 0,
+    `closingBalance` DECIMAL(10, 2) NOT NULL,
+    `issuedAt` DATETIME(3) NULL,
+    `issuedById` VARCHAR(191) NULL,
+    `voidedAt` DATETIME(3) NULL,
+    `voidedById` VARCHAR(191) NULL,
+    `voidReason` VARCHAR(191) NULL,
+    `notes` TEXT NULL,
+    `createdById` VARCHAR(191) NOT NULL,
+    `createdAt` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    `updatedAt` DATETIME(3) NOT NULL,
+
+    PRIMARY KEY (`id`),
+    UNIQUE INDEX `customer_invoices_tenantId_invoiceNumber_key`(`tenantId`, `invoiceNumber`),
+    INDEX `customer_invoices_tenantId_customerId_idx`(`tenantId`, `customerId`),
+    INDEX `customer_invoices_tenantId_status_idx`(`tenantId`, `status`),
+    INDEX `customer_invoices_tenantId_periodStart_periodEnd_idx`(`tenantId`, `periodStart`, `periodEnd`),
+    CONSTRAINT `customer_invoices_tenantId_fkey` FOREIGN KEY (`tenantId`) REFERENCES `tenants`(`id`) ON DELETE RESTRICT ON UPDATE CASCADE,
+    CONSTRAINT `customer_invoices_customerId_fkey` FOREIGN KEY (`customerId`) REFERENCES `customers`(`id`) ON DELETE RESTRICT ON UPDATE CASCADE,
+    CONSTRAINT `customer_invoices_createdById_fkey` FOREIGN KEY (`createdById`) REFERENCES `users`(`id`) ON DELETE RESTRICT ON UPDATE CASCADE,
+    CONSTRAINT `customer_invoices_issuedById_fkey` FOREIGN KEY (`issuedById`) REFERENCES `users`(`id`) ON DELETE SET NULL ON UPDATE CASCADE,
+    CONSTRAINT `customer_invoices_voidedById_fkey` FOREIGN KEY (`voidedById`) REFERENCES `users`(`id`) ON DELETE SET NULL ON UPDATE CASCADE
+) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE TABLE `customer_invoice_lines` (
+    `id` VARCHAR(191) NOT NULL,
+    `tenantId` VARCHAR(191) NOT NULL,
+    `invoiceId` VARCHAR(191) NOT NULL,
+    `lineType` ENUM('OPENING', 'DELIVERY', 'ORDER', 'ORDER_FEE', 'PAYMENT', 'ADJUSTMENT', 'OTHER') NOT NULL,
+    `productId` VARCHAR(191) NULL,
+    `description` VARCHAR(191) NOT NULL,
+    `quantity` DECIMAL(12, 3) NULL,
+    `unitPrice` DECIMAL(10, 2) NULL,
+    `amount` DECIMAL(10, 2) NOT NULL,
+    `referenceType` VARCHAR(191) NULL,
+    `referenceId` VARCHAR(191) NULL,
+    `occurredAt` DATETIME(3) NULL,
+    `sortOrder` INTEGER NOT NULL DEFAULT 0,
+
+    PRIMARY KEY (`id`),
+    INDEX `customer_invoice_lines_tenantId_invoiceId_idx`(`tenantId`, `invoiceId`),
+    INDEX `customer_invoice_lines_tenantId_lineType_idx`(`tenantId`, `lineType`),
+    CONSTRAINT `customer_invoice_lines_tenantId_fkey` FOREIGN KEY (`tenantId`) REFERENCES `tenants`(`id`) ON DELETE RESTRICT ON UPDATE CASCADE,
+    CONSTRAINT `customer_invoice_lines_invoiceId_fkey` FOREIGN KEY (`invoiceId`) REFERENCES `customer_invoices`(`id`) ON DELETE CASCADE ON UPDATE CASCADE
+) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;

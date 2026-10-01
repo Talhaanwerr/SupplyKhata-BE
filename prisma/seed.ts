@@ -77,9 +77,20 @@ const PERMISSION_MODULES = [
   'collections',
   'schedules',
   'planned-stops',
+  'orders',
+  'pos',
+  'invoices',
 ];
 
 const PERMISSION_ACTIONS = ['create', 'read', 'update', 'delete', 'manage'];
+
+/** Extra actions beyond the CRUD set (module:action). */
+const EXTRA_PERMISSIONS: { module: string; action: string; description: string }[] = [
+  { module: 'orders', action: 'cancel', description: 'Can cancel orders' },
+  { module: 'orders', action: 'refund', description: 'Can refund orders' },
+  { module: 'pos', action: 'void', description: 'Can void POS sales' },
+  { module: 'invoices', action: 'void', description: 'Can void issued invoices' },
+];
 
 const STARTER_PLANS = [
   {
@@ -197,6 +208,30 @@ const STARTER_FEATURE_FLAGS = [
     isGlobal: true,
     isActive: true,
   },
+  {
+    name: 'Orders',
+    slug: 'orders',
+    description:
+      'Customer orders channel (create, fulfill, pay, cancel, refund). Separate from delivery runs. Default OFF — enable per tenant.',
+    isGlobal: false,
+    isActive: true,
+  },
+  {
+    name: 'POS',
+    slug: 'pos',
+    description:
+      'Counter / walk-in sales with shifts, multi-tender payments, and same-day void. Default OFF — enable per tenant.',
+    isGlobal: false,
+    isActive: true,
+  },
+  {
+    name: 'Invoices',
+    slug: 'invoices',
+    description:
+      'Customer period invoices / statements from deliveries and orders. Derived document only — does not post new ledger sales. Default OFF — enable per tenant.',
+    isGlobal: false,
+    isActive: true,
+  },
 ];
 
 // ─── Helpers ──────────────────────────────────────────────────
@@ -213,6 +248,8 @@ function buildPermissions(): { module: string; action: string; description: stri
       });
     }
   }
+
+  permissions.push(...EXTRA_PERMISSIONS);
 
   return permissions;
 }
@@ -405,6 +442,19 @@ async function main(): Promise<void> {
       'planned-stops:read',
       'planned-stops:update',
       'planned-stops:delete',
+      'orders:create',
+      'orders:read',
+      'orders:update',
+      'orders:cancel',
+      'orders:refund',
+      'pos:create',
+      'pos:read',
+      'pos:update',
+      'pos:void',
+      'invoices:create',
+      'invoices:read',
+      'invoices:update',
+      'invoices:void',
     ]),
     permissions,
   );
@@ -470,6 +520,19 @@ async function main(): Promise<void> {
       'planned-stops:read',
       'planned-stops:update',
       'planned-stops:delete',
+      'orders:create',
+      'orders:read',
+      'orders:update',
+      'orders:cancel',
+      'orders:refund',
+      'pos:create',
+      'pos:read',
+      'pos:update',
+      'pos:void',
+      'invoices:create',
+      'invoices:read',
+      'invoices:update',
+      'invoices:void',
     ]),
     permissions,
   );

@@ -1,10 +1,18 @@
 import { Type } from 'class-transformer';
-import { IsInt, IsOptional, IsString, Matches, Max, Min } from 'class-validator';
+import { IsIn, IsInt, IsOptional, IsString, Matches, Max, Min } from 'class-validator';
+
+/** Sales channel for daily / monthly / product reports. POS deferred. */
+export const REPORT_SALES_CHANNELS = ['delivery', 'orders'] as const;
+export type ReportSalesChannel = (typeof REPORT_SALES_CHANNELS)[number];
 
 export class DailySalesQueryDto {
   @IsOptional()
   @Matches(/^\d{4}-\d{2}-\d{2}$/)
   date?: string;
+
+  @IsOptional()
+  @IsIn(REPORT_SALES_CHANNELS)
+  channel?: ReportSalesChannel;
 }
 
 export class MonthlySummaryQueryDto {
@@ -19,6 +27,10 @@ export class MonthlySummaryQueryDto {
   @Min(2000)
   @Max(2100)
   year!: number;
+
+  @IsOptional()
+  @IsIn(REPORT_SALES_CHANNELS)
+  channel?: ReportSalesChannel;
 }
 
 export class DateRangeQueryDto {
@@ -29,6 +41,10 @@ export class DateRangeQueryDto {
   @IsOptional()
   @Matches(/^\d{4}-\d{2}-\d{2}$/)
   to?: string;
+
+  @IsOptional()
+  @IsIn(REPORT_SALES_CHANNELS)
+  channel?: ReportSalesChannel;
 }
 
 export class CustomerLedgerReportQueryDto extends DateRangeQueryDto {
@@ -106,4 +122,8 @@ export class ReportExportQueryDto {
   @IsOptional()
   @IsString()
   search?: string;
+
+  @IsOptional()
+  @IsIn(REPORT_SALES_CHANNELS)
+  channel?: ReportSalesChannel;
 }

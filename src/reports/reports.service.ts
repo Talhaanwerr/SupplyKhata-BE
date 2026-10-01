@@ -1,5 +1,9 @@
 import { BadRequestException, Injectable, NotFoundException, StreamableFile } from '@nestjs/common';
-import { DeliveryStatus as PrismaDeliveryStatus, Prisma } from '@prisma/client';
+import {
+  DeliveryStatus as PrismaDeliveryStatus,
+  OrderStatus as PrismaOrderStatus,
+  Prisma,
+} from '@prisma/client';
 import type { Response } from 'express';
 // pdfkit is CommonJS (`export =`); default import compiles to `.default` and breaks at runtime.
 // eslint-disable-next-line @typescript-eslint/no-require-imports -- pdfkit CJS interop
@@ -7,6 +11,7 @@ import PDFDocument = require('pdfkit');
 import { PrismaService } from '../prisma/prisma.service';
 import { ContainerInventoryService } from '../container-inventory/container-inventory.service';
 import { toCsv } from '../export/export.service';
+import { isOrdersEnabled } from '../common/helpers/orders.helper';
 import {
   CustomerLedgerReportQueryDto,
   DailySalesQueryDto,
@@ -14,12 +19,21 @@ import {
   ExpensesReportQueryDto,
   MonthlySummaryQueryDto,
   ReportExportQueryDto,
+  ReportSalesChannel,
   RiderCollectionQueryDto,
   VehiclePerformanceQueryDto,
   CollectionPerformanceQueryDto,
 } from './dto/reports-query.dto';
 
 type DecimalLike = Prisma.Decimal | number | null | undefined;
+
+/** Fulfillment statuses that count as order sales (ORDER_SALE posted; not cancelled/refunded). */
+const BILLABLE_ORDER_STATUSES: PrismaOrderStatus[] = [
+  PrismaOrderStatus.PLACED,
+  PrismaOrderStatus.SHIPPED,
+  PrismaOrderStatus.PARTIALLY_DELIVERED,
+  PrismaOrderStatus.DELIVERED,
+];
 
 function decimalToNumber(value: DecimalLike): number {
   if (value == null) return 0;
@@ -55,6 +69,10 @@ function resolveRange(from?: string, to?: string): { from: Date; to: Date } {
   return { from: start, to: end };
 }
 
+function resolveChannel(channel?: ReportSalesChannel): ReportSalesChannel {
+  return channel === 'orders' ? 'orders' : 'delivery';
+}
+
 @Injectable()
 export class ReportsService {
   constructor(
@@ -64,6 +82,19 @@ export class ReportsService {
 
   async dailySales(tenantId: string, query: DailySalesQueryDto) {
     const day = query.date ? parseDay(query.date) : todayStart();
+    const channel = await this.resolveSalesChannel(tenantId, query.channel);
+    const dateStr = day.toISOString().slice(0, 10);
+
+    if (channel === 'orders') {
+      const orders = await this.loadBillableOrdersInRange(tenantId, day, endOfDay(day));
+      return {
+        date: dateStr,
+        channel,
+        deliveries: [] as Array<never>,
+        orders: orders.map((o) => this.mapOrderSaleRow(o)),
+      };
+    }
+
     const deliveries = await this.prisma.delivery.findMany({
       where: {
         tenantId,
@@ -85,7 +116,9 @@ export class ReportsService {
     });
 
     return {
-      date: day.toISOString().slice(0, 10),
+      date: dateStr,
+      channel,
+      orders: [] as Array<never>,
       deliveries: deliveries.map((d) => ({
         id: d.id,
         status: d.status,
@@ -112,8 +145,50 @@ export class ReportsService {
   async monthlySummary(tenantId: string, query: MonthlySummaryQueryDto) {
     const from = new Date(query.year, query.month - 1, 1, 0, 0, 0, 0);
     const to = new Date(query.year, query.month, 0, 23, 59, 59, 999);
-    const [deliveries, expensesAgg, refillAgg] = await Promise.all([
-      this.prisma.delivery.findMany({
+    const channel = await this.resolveSalesChannel(tenantId, query.channel);
+
+    const [expensesAgg, refillAgg] = await Promise.all([
+      this.prisma.expense.aggregate({
+        where: { tenantId, date: { gte: from, lte: to } },
+        _sum: { amount: true },
+      }),
+      this.prisma.refillBatch.aggregate({
+        where: { tenantId, date: { gte: from, lte: to } },
+        _sum: { totalCost: true },
+      }),
+    ]);
+
+    const byProduct = new Map<
+      string,
+      { productId: string; name: string; unitsDelivered: number; revenue: number; cogs: number }
+    >();
+    let revenue = 0;
+    let cogs = 0;
+
+    if (channel === 'orders') {
+      const orders = await this.loadBillableOrdersInRange(tenantId, from, to);
+      for (const order of orders) {
+        revenue += decimalToNumber(order.total);
+        for (const item of order.items) {
+          const rev = decimalToNumber(item.lineTotal);
+          const qty = decimalToNumber(item.quantity);
+          const cost = item.costSnapshot != null ? qty * decimalToNumber(item.costSnapshot) : 0;
+          cogs += cost;
+          const prev = byProduct.get(item.productId) ?? {
+            productId: item.productId,
+            name: item.product.name,
+            unitsDelivered: 0,
+            revenue: 0,
+            cogs: 0,
+          };
+          prev.unitsDelivered += qty;
+          prev.revenue += rev;
+          prev.cogs += cost;
+          byProduct.set(item.productId, prev);
+        }
+      }
+    } else {
+      const deliveries = await this.prisma.delivery.findMany({
         where: {
           tenantId,
           status: { not: PrismaDeliveryStatus.CANCELLED },
@@ -131,41 +206,27 @@ export class ReportsService {
             },
           },
         },
-      }),
-      this.prisma.expense.aggregate({
-        where: { tenantId, date: { gte: from, lte: to } },
-        _sum: { amount: true },
-      }),
-      this.prisma.refillBatch.aggregate({
-        where: { tenantId, date: { gte: from, lte: to } },
-        _sum: { totalCost: true },
-      }),
-    ]);
+      });
 
-    const byProduct = new Map<
-      string,
-      { productId: string; name: string; unitsDelivered: number; revenue: number; cogs: number }
-    >();
-    let revenue = 0;
-    let cogs = 0;
-    for (const d of deliveries) {
-      for (const item of d.items) {
-        const rev = decimalToNumber(item.lineTotal);
-        const qty = decimalToNumber(item.quantityDelivered);
-        const cost = qty * decimalToNumber(item.unitCostSnapshot);
-        revenue += rev;
-        cogs += cost;
-        const prev = byProduct.get(item.productId) ?? {
-          productId: item.productId,
-          name: item.product.name,
-          unitsDelivered: 0,
-          revenue: 0,
-          cogs: 0,
-        };
-        prev.unitsDelivered += qty;
-        prev.revenue += rev;
-        prev.cogs += cost;
-        byProduct.set(item.productId, prev);
+      for (const d of deliveries) {
+        for (const item of d.items) {
+          const rev = decimalToNumber(item.lineTotal);
+          const qty = decimalToNumber(item.quantityDelivered);
+          const cost = qty * decimalToNumber(item.unitCostSnapshot);
+          revenue += rev;
+          cogs += cost;
+          const prev = byProduct.get(item.productId) ?? {
+            productId: item.productId,
+            name: item.product.name,
+            unitsDelivered: 0,
+            revenue: 0,
+            cogs: 0,
+          };
+          prev.unitsDelivered += qty;
+          prev.revenue += rev;
+          prev.cogs += cost;
+          byProduct.set(item.productId, prev);
+        }
       }
     }
 
@@ -177,6 +238,7 @@ export class ReportsService {
     return {
       month: query.month,
       year: query.year,
+      channel,
       revenue: round2(revenue),
       deliveryCOGS: round2(cogs),
       refillCOGS,
@@ -196,45 +258,71 @@ export class ReportsService {
 
   async productPerformance(tenantId: string, query: DateRangeQueryDto) {
     const { from, to } = resolveRange(query.from, query.to);
-    const items = await this.prisma.deliveryItem.findMany({
-      where: {
-        tenantId,
-        delivery: {
-          status: { not: PrismaDeliveryStatus.CANCELLED },
-          deliveryDate: { gte: from, lte: to },
-        },
-      },
-      select: {
-        productId: true,
-        quantityDelivered: true,
-        lineTotal: true,
-        unitCostSnapshot: true,
-        product: { select: { name: true } },
-      },
-    });
+    const channel = await this.resolveSalesChannel(tenantId, query.channel);
 
     const map = new Map<
       string,
       { productId: string; name: string; unitsDelivered: number; revenue: number; cogs: number }
     >();
-    for (const item of items) {
-      const prev = map.get(item.productId) ?? {
-        productId: item.productId,
-        name: item.product.name,
-        unitsDelivered: 0,
-        revenue: 0,
-        cogs: 0,
-      };
-      const qty = decimalToNumber(item.quantityDelivered);
-      prev.unitsDelivered += qty;
-      prev.revenue += decimalToNumber(item.lineTotal);
-      prev.cogs += qty * decimalToNumber(item.unitCostSnapshot);
-      map.set(item.productId, prev);
+
+    if (channel === 'orders') {
+      const orders = await this.loadBillableOrdersInRange(tenantId, from, to);
+      for (const order of orders) {
+        for (const item of order.items) {
+          const prev = map.get(item.productId) ?? {
+            productId: item.productId,
+            name: item.product.name,
+            unitsDelivered: 0,
+            revenue: 0,
+            cogs: 0,
+          };
+          const qty = decimalToNumber(item.quantity);
+          prev.unitsDelivered += qty;
+          prev.revenue += decimalToNumber(item.lineTotal);
+          if (item.costSnapshot != null) {
+            prev.cogs += qty * decimalToNumber(item.costSnapshot);
+          }
+          map.set(item.productId, prev);
+        }
+      }
+    } else {
+      const items = await this.prisma.deliveryItem.findMany({
+        where: {
+          tenantId,
+          delivery: {
+            status: { not: PrismaDeliveryStatus.CANCELLED },
+            deliveryDate: { gte: from, lte: to },
+          },
+        },
+        select: {
+          productId: true,
+          quantityDelivered: true,
+          lineTotal: true,
+          unitCostSnapshot: true,
+          product: { select: { name: true } },
+        },
+      });
+
+      for (const item of items) {
+        const prev = map.get(item.productId) ?? {
+          productId: item.productId,
+          name: item.product.name,
+          unitsDelivered: 0,
+          revenue: 0,
+          cogs: 0,
+        };
+        const qty = decimalToNumber(item.quantityDelivered);
+        prev.unitsDelivered += qty;
+        prev.revenue += decimalToNumber(item.lineTotal);
+        prev.cogs += qty * decimalToNumber(item.unitCostSnapshot);
+        map.set(item.productId, prev);
+      }
     }
 
     return {
       from: from.toISOString().slice(0, 10),
       to: to.toISOString().slice(0, 10),
+      channel,
       products: [...map.values()]
         .map((p) => ({
           ...p,
@@ -243,6 +331,86 @@ export class ReportsService {
           grossMargin: round2(p.revenue - p.cogs),
         }))
         .sort((a, b) => b.revenue - a.revenue),
+    };
+  }
+
+  private async resolveSalesChannel(
+    tenantId: string,
+    channel?: ReportSalesChannel,
+  ): Promise<ReportSalesChannel> {
+    const resolved = resolveChannel(channel);
+    if (resolved === 'orders' && !(await isOrdersEnabled(this.prisma, tenantId))) {
+      throw new BadRequestException('Orders are disabled for this workspace');
+    }
+    return resolved;
+  }
+
+  /**
+   * Billable orders whose PLACED event falls in [from, to].
+   * Excludes DRAFT / CANCELLED / REFUNDED. Matches ORDER_SALE recognition date.
+   */
+  private async loadBillableOrdersInRange(tenantId: string, from: Date, to: Date) {
+    const placedEvents = await this.prisma.orderStatusEvent.findMany({
+      where: {
+        tenantId,
+        toStatus: PrismaOrderStatus.PLACED,
+        at: { gte: from, lte: to },
+        order: {
+          tenantId,
+          deletedAt: null,
+          status: { in: BILLABLE_ORDER_STATUSES },
+        },
+      },
+      select: { orderId: true },
+      distinct: ['orderId'],
+    });
+    const orderIds = placedEvents.map((e) => e.orderId);
+    if (orderIds.length === 0) return [];
+
+    return this.prisma.customerOrder.findMany({
+      where: {
+        tenantId,
+        id: { in: orderIds },
+        deletedAt: null,
+        status: { in: BILLABLE_ORDER_STATUSES },
+      },
+      orderBy: { orderNumber: 'asc' },
+      include: {
+        customer: { select: { id: true, name: true, phone: true } },
+        items: {
+          include: { product: { select: { id: true, name: true } } },
+          orderBy: { createdAt: 'asc' },
+        },
+      },
+    });
+  }
+
+  private mapOrderSaleRow(
+    o: Awaited<ReturnType<ReportsService['loadBillableOrdersInRange']>>[number],
+  ) {
+    return {
+      id: o.id,
+      orderNumber: o.orderNumber,
+      status: o.status,
+      paymentStatus: o.paymentStatus,
+      customerId: o.customer.id,
+      customerName: o.customer.name,
+      customerPhone: o.customer.phone,
+      subtotal: round2(decimalToNumber(o.subtotal)),
+      discountTotal: round2(decimalToNumber(o.discountTotal)),
+      deliveryCharges: round2(decimalToNumber(o.deliveryCharges)),
+      total: round2(decimalToNumber(o.total)),
+      amountPaid: round2(decimalToNumber(o.amountPaid)),
+      amountDue: round2(decimalToNumber(o.amountDue)),
+      items: o.items.map((i) => ({
+        productId: i.productId,
+        productName: i.product.name,
+        quantity: decimalToNumber(i.quantity),
+        quantityDelivered: decimalToNumber(i.quantityDelivered),
+        unitPrice: round2(decimalToNumber(i.unitPriceSnapshot)),
+        lineTotal: round2(decimalToNumber(i.lineTotal)),
+        unitCost: i.costSnapshot != null ? round2(decimalToNumber(i.costSnapshot)) : null,
+      })),
     };
   }
 
@@ -716,7 +884,49 @@ export class ReportsService {
   private async buildExportRows(tenantId: string, query: ReportExportQueryDto) {
     switch (query.type) {
       case 'daily-sales': {
-        const data = await this.dailySales(tenantId, { date: query.date });
+        const data = await this.dailySales(tenantId, {
+          date: query.date,
+          channel: query.channel,
+        });
+        if (data.channel === 'orders') {
+          const rows: Record<string, unknown>[] = [];
+          for (const o of data.orders) {
+            for (const item of o.items) {
+              rows.push({
+                orderId: o.id,
+                orderNumber: o.orderNumber,
+                status: o.status,
+                paymentStatus: o.paymentStatus,
+                customer: o.customerName,
+                product: item.productName,
+                qty: item.quantity,
+                qtyDelivered: item.quantityDelivered,
+                unitPrice: item.unitPrice,
+                lineTotal: item.lineTotal,
+                orderTotal: o.total,
+                amountPaid: o.amountPaid,
+              });
+            }
+          }
+          return {
+            title: `Daily Order Sales ${data.date}`,
+            headers: [
+              'orderId',
+              'orderNumber',
+              'status',
+              'paymentStatus',
+              'customer',
+              'product',
+              'qty',
+              'qtyDelivered',
+              'unitPrice',
+              'lineTotal',
+              'orderTotal',
+              'amountPaid',
+            ],
+            rows,
+          };
+        }
         const rows: Record<string, unknown>[] = [];
         for (const d of data.deliveries) {
           for (const item of d.items) {
@@ -758,9 +968,10 @@ export class ReportsService {
         const data = await this.monthlySummary(tenantId, {
           month: query.month,
           year: query.year,
+          channel: query.channel,
         });
         return {
-          title: `Monthly Summary ${query.year}-${String(query.month).padStart(2, '0')}`,
+          title: `Monthly Summary ${query.year}-${String(query.month).padStart(2, '0')} (${data.channel})`,
           headers: ['productId', 'name', 'unitsDelivered', 'revenue', 'cogs', 'grossMargin'],
           rows: data.byProduct as unknown as Record<string, unknown>[],
         };
@@ -769,9 +980,10 @@ export class ReportsService {
         const data = await this.productPerformance(tenantId, {
           from: query.from,
           to: query.to,
+          channel: query.channel,
         });
         return {
-          title: `Product Performance ${data.from} to ${data.to}`,
+          title: `Product Performance ${data.from} to ${data.to} (${data.channel})`,
           headers: ['productId', 'name', 'unitsDelivered', 'revenue', 'cogs', 'grossMargin'],
           rows: data.products as unknown as Record<string, unknown>[],
         };
