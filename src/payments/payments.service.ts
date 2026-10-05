@@ -6,6 +6,11 @@ import {
   Prisma,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import {
+  parseCalendarDateUtc,
+  startOfTodayInTimeZoneUtc,
+} from '../common/helpers/calendar-utc.helper';
+import { getTenantTimezone } from '../common/helpers/tenant-timezone.helper';
 import { AuditLogsService } from '../audit-logs/audit-logs.service';
 import { getPaginationParams, buildPaginationMeta } from '../common/helpers/pagination.helper';
 import { PaginatedData } from '../common/types/api-response.type';
@@ -35,8 +40,10 @@ function parseDate(value: string): Date {
 }
 
 function endOfDay(value: string): Date {
-  const d = parseDate(value);
-  d.setHours(23, 59, 59, 999);
+  const d = parseCalendarDateUtc(value, true);
+  if (Number.isNaN(d.getTime())) {
+    throw new BadRequestException('Invalid date');
+  }
   return d;
 }
 
@@ -358,8 +365,9 @@ export class PaymentsService {
   }
 
   async dashboard(tenantId: string) {
+    const tz = await getTenantTimezone(this.prisma, tenantId);
     const now = new Date();
-    const today = startOfDay(now);
+    const today = startOfTodayInTimeZoneUtc(tz, now);
 
     // Heal stale promises (e.g. paid promised amount but balance still open).
     await clearFulfilledPromisesForTenant(this.prisma, tenantId);

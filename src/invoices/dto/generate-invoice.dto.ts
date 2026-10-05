@@ -14,7 +14,7 @@ export class GenerateInvoiceDto {
 
   @ApiProperty({
     example: '2026-09-01',
-    description: 'Inclusive period start (YYYY-MM-DD, Asia/Karachi date-only)',
+    description: 'Inclusive period start (YYYY-MM-DD, tenant timezone date-only)',
   })
   @IsDateString()
   periodStart!: string;

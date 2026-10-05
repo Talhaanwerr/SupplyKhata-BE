@@ -8,6 +8,12 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AuditLogsService } from '../audit-logs/audit-logs.service';
 import { PaymentsService } from '../payments/payments.service';
 import {
+  parseCalendarDateUtc,
+  startOfTodayInTimeZoneUtc,
+  formatCalendarDateUtc,
+} from '../common/helpers/calendar-utc.helper';
+import { getTenantTimezone } from '../common/helpers/tenant-timezone.helper';
+import {
   lastDueDate,
   nextDueDate,
   sameCalendarDay,
@@ -62,7 +68,7 @@ function oldestOpenDebitAt(entries: Array<{ amount: DecimalLike; createdAt: Date
 }
 
 function parseDay(value: string): Date {
-  const d = new Date(`${value}T00:00:00`);
+  const d = parseCalendarDateUtc(value, false);
   if (Number.isNaN(d.getTime())) throw new BadRequestException('Invalid date');
   return d;
 }
@@ -76,7 +82,8 @@ export class CollectionsService {
   ) {}
 
   async list(tenantId: string, query: CollectionsListQueryDto, actorId: string) {
-    const today = query.date ? startOfDay(parseDay(query.date)) : startOfDay(new Date());
+    const tz = await getTenantTimezone(this.prisma, tenantId);
+    const today = query.date ? startOfDay(parseDay(query.date)) : startOfTodayInTimeZoneUtc(tz);
     const bucket = query.bucket ?? CollectionBucket.ALL;
     const riderOnly = await this.isRiderOnly(tenantId, actorId);
     const riderFilter = riderOnly ? actorId : query.riderId || undefined;
@@ -261,7 +268,8 @@ export class CollectionsService {
       throw new BadRequestException('Promise date is required when promise amount is set');
     }
 
-    const visitDate = dto.visitDate ? parseDay(dto.visitDate) : startOfDay(new Date());
+    const tz = await getTenantTimezone(this.prisma, tenantId);
+    const visitDate = dto.visitDate ? parseDay(dto.visitDate) : startOfTodayInTimeZoneUtc(tz);
     let paymentId: string | null = null;
     let amountCollected: number | null = null;
 
@@ -271,7 +279,7 @@ export class CollectionsService {
         {
           customerId,
           amount: dto.amount,
-          paymentDate: visitDate.toISOString().slice(0, 10),
+          paymentDate: formatCalendarDateUtc(visitDate),
           method: (dto.method ?? PaymentMethod.CASH) as PaymentMethod,
           collectedById: actorId,
           notes: dto.notes?.trim() || `Collection visit (${dto.outcome})`,

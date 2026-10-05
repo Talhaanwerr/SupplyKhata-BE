@@ -32,6 +32,13 @@ import { CollectionsModule } from './collections/collections.module';
 import { SchedulingModule } from './scheduling/scheduling.module';
 import { OrdersModule } from './orders/orders.module';
 import { InvoicesModule } from './invoices/invoices.module';
+import { InventoryModule } from './inventory/inventory.module';
+import { VendorsModule } from './vendors/vendors.module';
+import { RawMaterialsModule } from './raw-materials/raw-materials.module';
+import { PurchaseOrdersModule } from './purchase-orders/purchase-orders.module';
+import { VendorBillsModule } from './vendor-bills/vendor-bills.module';
+import { BomModule } from './bom/bom.module';
+import { ProductionModule } from './production/production.module';
 import { envValidationSchema } from './config/env.validation';
 import { winstonConfig } from './config/logger.config';
 
@@ -86,6 +93,13 @@ import { winstonConfig } from './config/logger.config';
     SchedulingModule,
     OrdersModule,
     InvoicesModule,
+    InventoryModule,
+    VendorsModule,
+    RawMaterialsModule,
+    PurchaseOrdersModule,
+    VendorBillsModule,
+    BomModule,
+    ProductionModule,
   ],
 })
 export class AppModule {}

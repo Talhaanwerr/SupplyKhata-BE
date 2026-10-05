@@ -4,6 +4,13 @@ import { PrismaService } from '../prisma/prisma.service';
 import { PaymentsService } from '../payments/payments.service';
 import { CashHandoversService } from '../cash-handovers/cash-handovers.service';
 import { DashboardQueryDto } from './dto/dashboard-query.dto';
+import {
+  endOfUtcDay,
+  formatCalendarDateUtc,
+  parseCalendarDateUtc,
+  startOfTodayInTimeZoneUtc,
+} from '../common/helpers/calendar-utc.helper';
+import { getTenantTimezone } from '../common/helpers/tenant-timezone.helper';
 
 type DecimalLike = Prisma.Decimal | number | null | undefined;
 
@@ -16,29 +23,22 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
-function parseDay(value?: string): Date {
-  if (!value) {
-    const d = new Date();
-    d.setHours(0, 0, 0, 0);
-    return d;
-  }
-  const d = new Date(`${value}T00:00:00`);
+function parseDay(value: string): Date {
+  const d = parseCalendarDateUtc(value, false);
   if (Number.isNaN(d.getTime())) throw new BadRequestException('Invalid date');
   return d;
 }
 
 function endOfDay(d: Date): Date {
-  const copy = new Date(d);
-  copy.setHours(23, 59, 59, 999);
-  return copy;
+  return endOfUtcDay(d);
 }
 
 function startOfMonth(d: Date): Date {
-  return new Date(d.getFullYear(), d.getMonth(), 1, 0, 0, 0, 0);
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1, 0, 0, 0, 0));
 }
 
 function endOfMonth(d: Date): Date {
-  return new Date(d.getFullYear(), d.getMonth() + 1, 0, 23, 59, 59, 999);
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0, 23, 59, 59, 999));
 }
 
 @Injectable()
@@ -50,7 +50,8 @@ export class DashboardService {
   ) {}
 
   async get(tenantId: string, query: DashboardQueryDto) {
-    const day = parseDay(query.date);
+    const tz = await getTenantTimezone(this.prisma, tenantId);
+    const day = query.date?.trim() ? parseDay(query.date) : startOfTodayInTimeZoneUtc(tz);
     const dayEnd = endOfDay(day);
     const monthStart = startOfMonth(day);
     const monthEnd = endOfMonth(day);
@@ -102,7 +103,7 @@ export class DashboardService {
     );
 
     return {
-      date: day.toISOString().slice(0, 10),
+      date: formatCalendarDateUtc(day),
       today: {
         totalUnitsDelivered: todayStats.totalUnits,
         byProduct: todayStats.byProduct.map((p) => ({

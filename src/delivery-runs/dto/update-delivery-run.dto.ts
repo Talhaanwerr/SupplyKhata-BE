@@ -35,4 +35,9 @@ export class UpdateDeliveryRunDto {
   @IsString()
   @MaxLength(500)
   notes?: string | null;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  loadLocationId?: string | null;
 }

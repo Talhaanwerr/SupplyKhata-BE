@@ -12,15 +12,32 @@ import { PrismaService } from '../prisma/prisma.service';
 import { ContainerInventoryService } from '../container-inventory/container-inventory.service';
 import { toCsv } from '../export/export.service';
 import { isOrdersEnabled } from '../common/helpers/orders.helper';
+import { isInventoryEnabled } from '../common/helpers/inventory.helper';
+import { isRawMaterialsEnabled } from '../common/helpers/raw-materials.helper';
+import { isPurchaseOrdersEnabled } from '../common/helpers/purchase-orders.helper';
+import { isVendorBillsEnabled } from '../common/helpers/vendor-bills.helper';
+import { isProductionEnabled } from '../common/helpers/production.helper';
+import { isVendorsEnabled } from '../common/helpers/vendors.helper';
+import {
+  endOfUtcDay,
+  formatCalendarDateUtc,
+  parseCalendarDateUtc,
+  startOfTodayInTimeZoneUtc,
+} from '../common/helpers/calendar-utc.helper';
+import { getTenantTimezone } from '../common/helpers/tenant-timezone.helper';
 import {
   CustomerLedgerReportQueryDto,
   DailySalesQueryDto,
   DateRangeQueryDto,
   ExpensesReportQueryDto,
   MonthlySummaryQueryDto,
+  ProductionYieldQueryDto,
+  PurchasesByVendorQueryDto,
+  RawConsumptionQueryDto,
   ReportExportQueryDto,
   ReportSalesChannel,
   RiderCollectionQueryDto,
+  StockOnHandQueryDto,
   VehiclePerformanceQueryDto,
   CollectionPerformanceQueryDto,
 } from './dto/reports-query.dto';
@@ -45,25 +62,23 @@ function round2(n: number): number {
 }
 
 function parseDay(value: string, label = 'date'): Date {
-  const d = new Date(`${value}T00:00:00`);
+  const d = parseCalendarDateUtc(value, false);
   if (Number.isNaN(d.getTime())) throw new BadRequestException(`Invalid ${label}`);
   return d;
 }
 
 function endOfDay(d: Date): Date {
-  const copy = new Date(d);
-  copy.setHours(23, 59, 59, 999);
-  return copy;
+  return endOfUtcDay(d);
 }
 
-function todayStart(): Date {
-  const d = new Date();
-  d.setHours(0, 0, 0, 0);
-  return d;
-}
-
-function resolveRange(from?: string, to?: string): { from: Date; to: Date } {
-  const start = from ? parseDay(from, 'from') : todayStart();
+async function resolveRange(
+  prisma: PrismaService,
+  tenantId: string,
+  from?: string,
+  to?: string,
+): Promise<{ from: Date; to: Date }> {
+  const tz = await getTenantTimezone(prisma, tenantId);
+  const start = from ? parseDay(from, 'from') : startOfTodayInTimeZoneUtc(tz);
   const end = to ? endOfDay(parseDay(to, 'to')) : endOfDay(start);
   if (end < start) throw new BadRequestException('to must be on or after from');
   return { from: start, to: end };
@@ -81,9 +96,10 @@ export class ReportsService {
   ) {}
 
   async dailySales(tenantId: string, query: DailySalesQueryDto) {
-    const day = query.date ? parseDay(query.date) : todayStart();
+    const tz = await getTenantTimezone(this.prisma, tenantId);
+    const day = query.date ? parseDay(query.date) : startOfTodayInTimeZoneUtc(tz);
     const channel = await this.resolveSalesChannel(tenantId, query.channel);
-    const dateStr = day.toISOString().slice(0, 10);
+    const dateStr = formatCalendarDateUtc(day);
 
     if (channel === 'orders') {
       const orders = await this.loadBillableOrdersInRange(tenantId, day, endOfDay(day));
@@ -257,7 +273,7 @@ export class ReportsService {
   }
 
   async productPerformance(tenantId: string, query: DateRangeQueryDto) {
-    const { from, to } = resolveRange(query.from, query.to);
+    const { from, to } = await resolveRange(this.prisma, tenantId, query.from, query.to);
     const channel = await this.resolveSalesChannel(tenantId, query.channel);
 
     const map = new Map<
@@ -320,8 +336,8 @@ export class ReportsService {
     }
 
     return {
-      from: from.toISOString().slice(0, 10),
-      to: to.toISOString().slice(0, 10),
+      from: formatCalendarDateUtc(from),
+      to: formatCalendarDateUtc(to),
       channel,
       products: [...map.values()]
         .map((p) => ({
@@ -483,7 +499,7 @@ export class ReportsService {
     });
     if (!customer) throw new NotFoundException('Customer not found');
 
-    const { from, to } = resolveRange(query.from, query.to);
+    const { from, to } = await resolveRange(this.prisma, tenantId, query.from, query.to);
     const entries = await this.prisma.customerLedgerEntry.findMany({
       where: {
         tenantId,
@@ -502,8 +518,8 @@ export class ReportsService {
 
     return {
       customer,
-      from: from.toISOString().slice(0, 10),
-      to: to.toISOString().slice(0, 10),
+      from: formatCalendarDateUtc(from),
+      to: formatCalendarDateUtc(to),
       openingBalance: round2(running),
       entries: entries.map((e) => {
         running += decimalToNumber(e.amount);
@@ -528,7 +544,7 @@ export class ReportsService {
   }
 
   async riderCollection(tenantId: string, query: RiderCollectionQueryDto) {
-    const { from, to } = resolveRange(query.from, query.to);
+    const { from, to } = await resolveRange(this.prisma, tenantId, query.from, query.to);
     const where: Prisma.DeliveryWhereInput = {
       tenantId,
       status: { not: PrismaDeliveryStatus.CANCELLED },
@@ -583,8 +599,8 @@ export class ReportsService {
     }
 
     return {
-      from: from.toISOString().slice(0, 10),
-      to: to.toISOString().slice(0, 10),
+      from: formatCalendarDateUtc(from),
+      to: formatCalendarDateUtc(to),
       riders: [...byRider.values()]
         .map((r) => ({
           ...r,
@@ -596,7 +612,7 @@ export class ReportsService {
   }
 
   async vehiclePerformance(tenantId: string, query: VehiclePerformanceQueryDto) {
-    const { from, to } = resolveRange(query.from, query.to);
+    const { from, to } = await resolveRange(this.prisma, tenantId, query.from, query.to);
     const vehicles = await this.prisma.vehicle.findMany({
       where: {
         tenantId,
@@ -608,8 +624,8 @@ export class ReportsService {
     });
     if (vehicles.length === 0) {
       return {
-        from: from.toISOString().slice(0, 10),
-        to: to.toISOString().slice(0, 10),
+        from: formatCalendarDateUtc(from),
+        to: formatCalendarDateUtc(to),
         vehicles: [],
       };
     }
@@ -677,7 +693,7 @@ export class ReportsService {
     }
 
     const ensureDay = (agg: Agg, date: Date) => {
-      const key = date.toISOString().slice(0, 10);
+      const key = formatCalendarDateUtc(date);
       let row = agg.seriesMap.get(key);
       if (!row) {
         row = { date: key, runs: 0, sales: 0, expenses: 0 };
@@ -716,8 +732,8 @@ export class ReportsService {
     }
 
     return {
-      from: from.toISOString().slice(0, 10),
-      to: to.toISOString().slice(0, 10),
+      from: formatCalendarDateUtc(from),
+      to: formatCalendarDateUtc(to),
       vehicles: [...byVehicle.values()].map((agg) => ({
         vehicleId: agg.vehicleId,
         name: agg.name,
@@ -745,7 +761,7 @@ export class ReportsService {
   }
 
   async collectionPerformance(tenantId: string, query: CollectionPerformanceQueryDto) {
-    const { from, to } = resolveRange(query.from, query.to);
+    const { from, to } = await resolveRange(this.prisma, tenantId, query.from, query.to);
     const visits = await this.prisma.collectionVisit.findMany({
       where: {
         tenantId,
@@ -806,8 +822,8 @@ export class ReportsService {
     }
 
     return {
-      from: from.toISOString().slice(0, 10),
-      to: to.toISOString().slice(0, 10),
+      from: formatCalendarDateUtc(from),
+      to: formatCalendarDateUtc(to),
       collectors: [...byCollector.values()]
         .map((c) => ({ ...c, collectedAmount: round2(c.collectedAmount) }))
         .sort((a, b) => b.collectedAmount - a.collectedAmount),
@@ -818,7 +834,7 @@ export class ReportsService {
   }
 
   async expensesReport(tenantId: string, query: ExpensesReportQueryDto) {
-    const { from, to } = resolveRange(query.from, query.to);
+    const { from, to } = await resolveRange(this.prisma, tenantId, query.from, query.to);
     const expenses = await this.prisma.expense.findMany({
       where: {
         tenantId,
@@ -834,20 +850,369 @@ export class ReportsService {
 
     const total = round2(expenses.reduce((s, e) => s + decimalToNumber(e.amount), 0));
     return {
-      from: from.toISOString().slice(0, 10),
-      to: to.toISOString().slice(0, 10),
+      from: formatCalendarDateUtc(from),
+      to: formatCalendarDateUtc(to),
       total,
       expenses: expenses.map((e) => ({
         id: e.id,
         title: e.title,
         description: e.description,
-        date: e.date.toISOString().slice(0, 10),
+        date: formatCalendarDateUtc(e.date),
         amount: round2(decimalToNumber(e.amount)),
         paymentMethod: e.paymentMethod,
         isPaidByRider: e.isPaidByRider,
         vehicleName: e.vehicle?.name ?? null,
         staffName: e.staff ? `${e.staff.firstName} ${e.staff.lastName}`.trim() : null,
       })),
+    };
+  }
+
+  /** Finished goods + raw on-hand. Empty sections when flags OFF — never queries DeliveryRunStock. */
+  async stockOnHand(tenantId: string, query: StockOnHandQueryDto) {
+    const inventoryOn = await isInventoryEnabled(this.prisma, tenantId);
+    const rawOn = await isRawMaterialsEnabled(this.prisma, tenantId);
+
+    const finished = inventoryOn
+      ? (
+          await this.prisma.stockBalance.findMany({
+            where: {
+              tenantId,
+              ...(query.locationId ? { locationId: query.locationId } : {}),
+            },
+            orderBy: [{ locationId: 'asc' }, { productId: 'asc' }],
+            include: {
+              product: { select: { id: true, name: true, sku: true, baseUnit: true } },
+              location: { select: { id: true, name: true, isDefault: true } },
+            },
+          })
+        ).map((r) => ({
+          productId: r.productId,
+          productName: r.product.name,
+          sku: r.product.sku,
+          baseUnit: r.product.baseUnit,
+          locationId: r.locationId,
+          locationName: r.location.name,
+          quantity: round2(decimalToNumber(r.quantity)),
+        }))
+      : [];
+
+    const raw = rawOn
+      ? (
+          await this.prisma.rawMaterialBalance.findMany({
+            where: {
+              tenantId,
+              ...(query.locationId ? { locationId: query.locationId } : {}),
+            },
+            orderBy: [{ locationId: 'asc' }, { rawMaterialId: 'asc' }],
+            include: {
+              rawMaterial: { select: { id: true, name: true, sku: true, unit: true } },
+              location: { select: { id: true, name: true, isDefault: true } },
+            },
+          })
+        ).map((r) => ({
+          rawMaterialId: r.rawMaterialId,
+          rawMaterialName: r.rawMaterial.name,
+          sku: r.rawMaterial.sku,
+          unit: r.rawMaterial.unit,
+          locationId: r.locationId,
+          locationName: r.location.name,
+          quantity: round2(decimalToNumber(r.quantity)),
+        }))
+      : [];
+
+    return {
+      inventoryEnabled: inventoryOn,
+      rawMaterialsEnabled: rawOn,
+      locationId: query.locationId ?? null,
+      finished,
+      raw,
+      notes: [
+        !inventoryOn ? 'Enable Inventory for finished-goods on-hand.' : null,
+        !rawOn ? 'Enable Raw Materials for raw on-hand.' : null,
+      ].filter(Boolean),
+    };
+  }
+
+  async purchasesByVendor(tenantId: string, query: PurchasesByVendorQueryDto) {
+    const vendorsOn = await isVendorsEnabled(this.prisma, tenantId);
+    const poOn = await isPurchaseOrdersEnabled(this.prisma, tenantId);
+    const billsOn = await isVendorBillsEnabled(this.prisma, tenantId);
+    if (!vendorsOn) {
+      return {
+        vendorsEnabled: false,
+        purchaseOrdersEnabled: poOn,
+        vendorBillsEnabled: billsOn,
+        from: query.from ?? null,
+        to: query.to ?? null,
+        vendors: [],
+        notes: ['Enable Vendors to view purchases by vendor.'],
+      };
+    }
+
+    const { from, to } = await resolveRange(this.prisma, tenantId, query.from, query.to);
+    const vendorFilter = query.vendorId ? { vendorId: query.vendorId } : {};
+
+    const vendors = await this.prisma.vendor.findMany({
+      where: {
+        tenantId,
+        ...(query.vendorId ? { id: query.vendorId } : {}),
+        isActive: true,
+      },
+      select: { id: true, name: true, phone: true },
+      orderBy: { name: 'asc' },
+    });
+
+    const poRows = poOn
+      ? await this.prisma.purchaseOrder.findMany({
+          where: {
+            tenantId,
+            ...vendorFilter,
+            createdAt: { gte: from, lte: to },
+            status: { not: 'CANCELLED' },
+          },
+          include: { lines: true },
+        })
+      : [];
+
+    const billRows = billsOn
+      ? await this.prisma.vendorBill.findMany({
+          where: {
+            tenantId,
+            ...vendorFilter,
+            billDate: { gte: from, lte: to },
+            status: { not: 'VOID' },
+          },
+          select: {
+            vendorId: true,
+            totalAmount: true,
+            paidAmount: true,
+            status: true,
+          },
+        })
+      : [];
+
+    const byVendor = new Map<
+      string,
+      {
+        vendorId: string;
+        vendorName: string;
+        phone: string | null;
+        poCount: number;
+        poOrderedAmount: number;
+        billCount: number;
+        billTotal: number;
+        billPaid: number;
+      }
+    >();
+
+    for (const v of vendors) {
+      byVendor.set(v.id, {
+        vendorId: v.id,
+        vendorName: v.name,
+        phone: v.phone,
+        poCount: 0,
+        poOrderedAmount: 0,
+        billCount: 0,
+        billTotal: 0,
+        billPaid: 0,
+      });
+    }
+
+    for (const po of poRows) {
+      let row = byVendor.get(po.vendorId);
+      if (!row) {
+        row = {
+          vendorId: po.vendorId,
+          vendorName: 'Unknown',
+          phone: null,
+          poCount: 0,
+          poOrderedAmount: 0,
+          billCount: 0,
+          billTotal: 0,
+          billPaid: 0,
+        };
+        byVendor.set(po.vendorId, row);
+      }
+      row.poCount += 1;
+      row.poOrderedAmount += po.lines.reduce(
+        (s, l) => s + decimalToNumber(l.qtyOrdered) * decimalToNumber(l.unitCost),
+        0,
+      );
+    }
+
+    for (const b of billRows) {
+      let row = byVendor.get(b.vendorId);
+      if (!row) {
+        row = {
+          vendorId: b.vendorId,
+          vendorName: 'Unknown',
+          phone: null,
+          poCount: 0,
+          poOrderedAmount: 0,
+          billCount: 0,
+          billTotal: 0,
+          billPaid: 0,
+        };
+        byVendor.set(b.vendorId, row);
+      }
+      row.billCount += 1;
+      row.billTotal += decimalToNumber(b.totalAmount);
+      row.billPaid += decimalToNumber(b.paidAmount);
+    }
+
+    const list = [...byVendor.values()]
+      .filter((v) => v.poCount > 0 || v.billCount > 0 || !!query.vendorId)
+      .map((v) => ({
+        ...v,
+        poOrderedAmount: round2(v.poOrderedAmount),
+        billTotal: round2(v.billTotal),
+        billPaid: round2(v.billPaid),
+        billOutstanding: round2(v.billTotal - v.billPaid),
+      }))
+      .sort((a, b) => b.billTotal + b.poOrderedAmount - (a.billTotal + a.poOrderedAmount));
+
+    return {
+      vendorsEnabled: true,
+      purchaseOrdersEnabled: poOn,
+      vendorBillsEnabled: billsOn,
+      from: formatCalendarDateUtc(from),
+      to: formatCalendarDateUtc(to),
+      vendors: list,
+      notes: [
+        !poOn ? 'Enable Purchase Orders for PO totals.' : null,
+        !billsOn ? 'Enable Vendor Bills for bill totals.' : null,
+      ].filter(Boolean),
+    };
+  }
+
+  async productionYield(tenantId: string, query: ProductionYieldQueryDto) {
+    const productionOn = await isProductionEnabled(this.prisma, tenantId);
+    if (!productionOn) {
+      return {
+        productionEnabled: false,
+        from: query.from ?? null,
+        to: query.to ?? null,
+        orders: [],
+        notes: ['Enable Production for yield report.'],
+      };
+    }
+
+    const { from, to } = await resolveRange(this.prisma, tenantId, query.from, query.to);
+    const orders = await this.prisma.productionOrder.findMany({
+      where: {
+        tenantId,
+        status: 'COMPLETED',
+        completedAt: { gte: from, lte: to },
+        ...(query.productId ? { productId: query.productId } : {}),
+      },
+      orderBy: { completedAt: 'desc' },
+      include: {
+        product: { select: { id: true, name: true, sku: true } },
+      },
+    });
+
+    return {
+      productionEnabled: true,
+      from: formatCalendarDateUtc(from),
+      to: formatCalendarDateUtc(to),
+      orders: orders.map((o) => {
+        const planned = decimalToNumber(o.plannedQty);
+        const actual = decimalToNumber(o.actualQty);
+        return {
+          id: o.id,
+          productId: o.productId,
+          productName: o.product.name,
+          sku: o.product.sku,
+          plannedQty: round2(planned),
+          actualQty: round2(actual),
+          scrapQty: round2(decimalToNumber(o.scrapQty)),
+          varianceQty: round2(actual - planned),
+          varianceNote: o.varianceNote,
+          scrapReason: o.scrapReason,
+          completedAt: o.completedAt?.toISOString() ?? null,
+        };
+      }),
+      notes: [] as string[],
+    };
+  }
+
+  async rawConsumption(tenantId: string, query: RawConsumptionQueryDto) {
+    const productionOn = await isProductionEnabled(this.prisma, tenantId);
+    const rawOn = await isRawMaterialsEnabled(this.prisma, tenantId);
+    if (!productionOn || !rawOn) {
+      return {
+        productionEnabled: productionOn,
+        rawMaterialsEnabled: rawOn,
+        from: query.from ?? null,
+        to: query.to ?? null,
+        lines: [],
+        notes: [
+          !productionOn ? 'Enable Production for consumption data.' : null,
+          !rawOn ? 'Enable Raw Materials for consumption data.' : null,
+        ].filter(Boolean),
+      };
+    }
+
+    const { from, to } = await resolveRange(this.prisma, tenantId, query.from, query.to);
+    const rows = await this.prisma.productionConsumeLine.findMany({
+      where: {
+        tenantId,
+        ...(query.rawMaterialId ? { rawMaterialId: query.rawMaterialId } : {}),
+        productionOrder: {
+          status: 'COMPLETED',
+          completedAt: { gte: from, lte: to },
+          ...(query.productId ? { productId: query.productId } : {}),
+        },
+      },
+      include: {
+        rawMaterial: { select: { id: true, name: true, unit: true, sku: true } },
+        productionOrder: {
+          select: {
+            id: true,
+            productId: true,
+            completedAt: true,
+            product: { select: { id: true, name: true } },
+          },
+        },
+      },
+    });
+
+    const aggregated = new Map<
+      string,
+      {
+        rawMaterialId: string;
+        rawMaterialName: string;
+        unit: string;
+        sku: string | null;
+        qtyConsumed: number;
+        orderCount: number;
+      }
+    >();
+
+    for (const r of rows) {
+      const key = r.rawMaterialId;
+      const cur = aggregated.get(key) ?? {
+        rawMaterialId: r.rawMaterialId,
+        rawMaterialName: r.rawMaterial.name,
+        unit: r.rawMaterial.unit,
+        sku: r.rawMaterial.sku,
+        qtyConsumed: 0,
+        orderCount: 0,
+      };
+      cur.qtyConsumed += decimalToNumber(r.qtyConsumed);
+      cur.orderCount += 1;
+      aggregated.set(key, cur);
+    }
+
+    return {
+      productionEnabled: true,
+      rawMaterialsEnabled: true,
+      from: formatCalendarDateUtc(from),
+      to: formatCalendarDateUtc(to),
+      lines: [...aggregated.values()]
+        .map((l) => ({ ...l, qtyConsumed: round2(l.qtyConsumed) }))
+        .sort((a, b) => b.qtyConsumed - a.qtyConsumed),
+      notes: [] as string[],
     };
   }
 
@@ -1088,9 +1453,86 @@ export class ReportsService {
           })),
         };
       }
+      case 'stock-on-hand': {
+        const data = await this.stockOnHand(tenantId, { locationId: query.locationId });
+        return {
+          title: 'Stock on hand',
+          headers: ['kind', 'name', 'sku', 'locationName', 'unit', 'quantity'],
+          rows: [
+            ...data.finished.map((r) => ({
+              kind: 'finished',
+              name: r.productName,
+              sku: r.sku,
+              locationName: r.locationName,
+              unit: r.baseUnit,
+              quantity: r.quantity,
+            })),
+            ...data.raw.map((r) => ({
+              kind: 'raw',
+              name: r.rawMaterialName,
+              sku: r.sku,
+              locationName: r.locationName,
+              unit: r.unit,
+              quantity: r.quantity,
+            })),
+          ],
+        };
+      }
+      case 'purchases-by-vendor': {
+        const data = await this.purchasesByVendor(tenantId, {
+          from: query.from,
+          to: query.to,
+          vendorId: query.vendorId,
+        });
+        return {
+          title: `Purchases by vendor ${data.from} to ${data.to}`,
+          headers: [
+            'vendorName',
+            'poCount',
+            'poOrderedAmount',
+            'billCount',
+            'billTotal',
+            'billPaid',
+            'billOutstanding',
+          ],
+          rows: data.vendors as unknown as Record<string, unknown>[],
+        };
+      }
+      case 'production-yield': {
+        const data = await this.productionYield(tenantId, {
+          from: query.from,
+          to: query.to,
+          productId: query.productId,
+        });
+        return {
+          title: `Production yield ${data.from} to ${data.to}`,
+          headers: [
+            'productName',
+            'plannedQty',
+            'actualQty',
+            'scrapQty',
+            'varianceQty',
+            'completedAt',
+          ],
+          rows: data.orders as unknown as Record<string, unknown>[],
+        };
+      }
+      case 'raw-consumption': {
+        const data = await this.rawConsumption(tenantId, {
+          from: query.from,
+          to: query.to,
+          productId: query.productId,
+          rawMaterialId: query.rawMaterialId,
+        });
+        return {
+          title: `Raw consumption ${data.from} to ${data.to}`,
+          headers: ['rawMaterialName', 'unit', 'qtyConsumed', 'orderCount'],
+          rows: data.lines as unknown as Record<string, unknown>[],
+        };
+      }
       default:
         throw new BadRequestException(
-          'type must be one of: daily-sales, monthly-summary, product-performance, customer-outstanding, customer-ledger, container-inventory, rider-collection, expenses',
+          'type must be one of: daily-sales, monthly-summary, product-performance, customer-outstanding, customer-ledger, container-inventory, rider-collection, expenses, stock-on-hand, purchases-by-vendor, production-yield, raw-consumption',
         );
     }
   }

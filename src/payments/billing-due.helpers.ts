@@ -1,6 +1,10 @@
 /**
  * Pure cycle-aware billing due date helpers (unit-testable).
  *
+ * Uses UTC calendar days so host process timezone does not shift due dates.
+ * Callers should pass `today` already normalized to the tenant's business day
+ * (UTC midnight of that Y-M-D).
+ *
  * WEEKLY: every 7 days from billingAnchorDate
  * FORTNIGHTLY: every 14 days from billingAnchorDate
  * MONTHLY / CUSTOM: day-of-month billingDueDate (1–31, clamped to month length)
@@ -12,19 +16,17 @@ export type BillingCycle = 'CASH_ON_DELIVERY' | 'WEEKLY' | 'FORTNIGHTLY' | 'MONT
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 export function startOfDay(d: Date): Date {
-  const copy = new Date(d);
-  copy.setHours(0, 0, 0, 0);
-  return copy;
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, 0, 0, 0));
 }
 
 function clampDay(year: number, month: number, day: number): number {
-  const last = new Date(year, month + 1, 0).getDate();
+  const last = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
   return Math.min(day, last);
 }
 
 function addDays(d: Date, days: number): Date {
   const result = startOfDay(d);
-  result.setDate(result.getDate() + days);
+  result.setUTCDate(result.getUTCDate() + days);
   return startOfDay(result);
 }
 
@@ -56,34 +58,24 @@ function lastDueFromAnchor(today: Date, anchor: Date, intervalDays: number): Dat
 
 function nextMonthlyDue(today: Date, billingDueDate: number): Date {
   const t = startOfDay(today);
-  const y = t.getFullYear();
-  const m = t.getMonth();
-  const dueThisMonth = startOfDay(new Date(y, m, clampDay(y, m, billingDueDate)));
+  const y = t.getUTCFullYear();
+  const m = t.getUTCMonth();
+  const dueThisMonth = startOfDay(new Date(Date.UTC(y, m, clampDay(y, m, billingDueDate))));
   if (t.getTime() <= dueThisMonth.getTime()) return dueThisMonth;
-  const next = new Date(y, m + 1, 1);
-  return startOfDay(
-    new Date(
-      next.getFullYear(),
-      next.getMonth(),
-      clampDay(next.getFullYear(), next.getMonth(), billingDueDate),
-    ),
-  );
+  const nextY = m === 11 ? y + 1 : y;
+  const nextM = m === 11 ? 0 : m + 1;
+  return startOfDay(new Date(Date.UTC(nextY, nextM, clampDay(nextY, nextM, billingDueDate))));
 }
 
 function lastMonthlyDue(today: Date, billingDueDate: number): Date {
   const t = startOfDay(today);
-  const y = t.getFullYear();
-  const m = t.getMonth();
-  const dueThisMonth = startOfDay(new Date(y, m, clampDay(y, m, billingDueDate)));
+  const y = t.getUTCFullYear();
+  const m = t.getUTCMonth();
+  const dueThisMonth = startOfDay(new Date(Date.UTC(y, m, clampDay(y, m, billingDueDate))));
   if (t.getTime() >= dueThisMonth.getTime()) return dueThisMonth;
-  const prev = new Date(y, m - 1, 1);
-  return startOfDay(
-    new Date(
-      prev.getFullYear(),
-      prev.getMonth(),
-      clampDay(prev.getFullYear(), prev.getMonth(), billingDueDate),
-    ),
-  );
+  const prevY = m === 0 ? y - 1 : y;
+  const prevM = m === 0 ? 11 : m - 1;
+  return startOfDay(new Date(Date.UTC(prevY, prevM, clampDay(prevY, prevM, billingDueDate))));
 }
 
 /**
@@ -140,7 +132,7 @@ export function lastDueDate(
   }
 }
 
-/** True when two dates fall on the same calendar day (local). */
+/** True when two dates fall on the same UTC calendar day. */
 export function sameCalendarDay(a: Date, b: Date): boolean {
   return startOfDay(a).getTime() === startOfDay(b).getTime();
 }

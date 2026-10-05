@@ -55,4 +55,10 @@ export class CreateDeliveryRunDto {
   @IsString()
   @MaxLength(500)
   notes?: string | null;
+
+  /** Warehouse location for truck load when inventory ON (defaults to Main). */
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  loadLocationId?: string | null;
 }

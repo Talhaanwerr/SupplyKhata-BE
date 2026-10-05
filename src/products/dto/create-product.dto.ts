@@ -107,6 +107,14 @@ export class CreateProductDto {
   @IsBoolean()
   isActive?: boolean;
 
+  /** Low-stock threshold (base units). Used when inventory flag is ON. */
+  @ApiPropertyOptional({ example: 10, nullable: true })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber({ maxDecimalPlaces: 3 })
+  @Min(0)
+  reorderLevel?: number | null;
+
   /** Optional initial cost recorded on create (effective today). */
   @ApiPropertyOptional({ example: 180 })
   @IsOptional()

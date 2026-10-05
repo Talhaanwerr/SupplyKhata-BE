@@ -81,6 +81,34 @@ export class ExpensesReportQueryDto extends DateRangeQueryDto {
   search?: string;
 }
 
+export class StockOnHandQueryDto {
+  @IsOptional()
+  @IsString()
+  locationId?: string;
+}
+
+export class PurchasesByVendorQueryDto extends DateRangeQueryDto {
+  @IsOptional()
+  @IsString()
+  vendorId?: string;
+}
+
+export class ProductionYieldQueryDto extends DateRangeQueryDto {
+  @IsOptional()
+  @IsString()
+  productId?: string;
+}
+
+export class RawConsumptionQueryDto extends DateRangeQueryDto {
+  @IsOptional()
+  @IsString()
+  productId?: string;
+
+  @IsOptional()
+  @IsString()
+  rawMaterialId?: string;
+}
+
 export class ReportExportQueryDto {
   @IsString()
   type!: string;
@@ -122,6 +150,22 @@ export class ReportExportQueryDto {
   @IsOptional()
   @IsString()
   search?: string;
+
+  @IsOptional()
+  @IsString()
+  locationId?: string;
+
+  @IsOptional()
+  @IsString()
+  vendorId?: string;
+
+  @IsOptional()
+  @IsString()
+  productId?: string;
+
+  @IsOptional()
+  @IsString()
+  rawMaterialId?: string;
 
   @IsOptional()
   @IsIn(REPORT_SALES_CHANNELS)

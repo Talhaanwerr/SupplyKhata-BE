@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { parseCalendarDateUtc } from '../common/helpers/calendar-utc.helper';
 import { AuditLogsService } from '../audit-logs/audit-logs.service';
 import { getPaginationParams, buildPaginationMeta } from '../common/helpers/pagination.helper';
 import { PaginatedData } from '../common/types/api-response.type';
@@ -24,8 +25,10 @@ function parseDate(value: string): Date {
 }
 
 function endOfDay(value: string): Date {
-  const d = parseDate(value);
-  d.setHours(23, 59, 59, 999);
+  const d = parseCalendarDateUtc(value, true);
+  if (Number.isNaN(d.getTime())) {
+    throw new BadRequestException('Invalid date');
+  }
   return d;
 }
 

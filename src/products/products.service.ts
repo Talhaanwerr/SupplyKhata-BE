@@ -17,46 +17,17 @@ import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { ListProductsQueryDto } from './dto/list-products-query.dto';
 import { CreateProductCostDto } from './dto/create-product-cost.dto';
+import {
+  endOfTodayInTimeZoneUtc,
+  formatCalendarDateUtc,
+  parseCalendarDateUtc,
+  startOfTodayInTimeZoneUtc,
+} from '../common/helpers/calendar-utc.helper';
+import { getTenantTimezone } from '../common/helpers/tenant-timezone.helper';
 
 function decimalToNumber(value: Prisma.Decimal | null | undefined): number | null {
   if (value == null) return null;
   return Number(value.toString());
-}
-
-/**
- * Cost dates are calendar days, stored as UTC midnight for that Y-M-D.
- * Resolving "current" uses end of today's local calendar day in UTC so
- * same-day entries always count (avoids PKT/UTC midnight bugs).
- */
-function parseCalendarDateUtc(value: string, endOfDay = false): Date {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.trim());
-  if (!match) {
-    const parsed = new Date(value);
-    return parsed;
-  }
-  const year = Number(match[1]);
-  const month = Number(match[2]) - 1;
-  const day = Number(match[3]);
-  return endOfDay
-    ? new Date(Date.UTC(year, month, day, 23, 59, 59, 999))
-    : new Date(Date.UTC(year, month, day, 0, 0, 0, 0));
-}
-
-/** End of the user's local calendar "today", expressed in UTC. */
-function endOfLocalTodayUtc(now = new Date()): Date {
-  return new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999));
-}
-
-/** Start of the user's local calendar "today", expressed in UTC. */
-function startOfLocalTodayUtc(now = new Date()): Date {
-  return new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0));
-}
-
-function formatCalendarDateUtc(date: Date): string {
-  const y = date.getUTCFullYear();
-  const m = String(date.getUTCMonth() + 1).padStart(2, '0');
-  const d = String(date.getUTCDate()).padStart(2, '0');
-  return `${y}-${m}-${d}`;
 }
 
 function defaultUnitLabel(baseUnit: ProductBaseUnit | PrismaProductBaseUnit): string {
@@ -100,6 +71,8 @@ export type ProductItem = {
   containerCapacity: number | null;
   allowFractionalQty: boolean;
   hasPackHelper: boolean;
+  /** Low-stock threshold in base units (inventory module). */
+  reorderLevel: number | null;
   createdAt: Date;
   updatedAt: Date;
   currentCost: number | null;
@@ -133,19 +106,21 @@ export class ProductsService {
       orderBy: { name: 'asc' },
     });
 
+    const tz = await getTenantTimezone(this.prisma, tenantId);
     const costMap = await this.resolveCurrentCosts(
       tenantId,
       products.map((p) => p.id),
-      endOfLocalTodayUtc(),
+      endOfTodayInTimeZoneUtc(tz),
     );
 
     return products.map((p) => this.toItem(p, costMap.get(p.id) ?? null));
   }
 
   async findOne(id: string, tenantId: string): Promise<ProductItem> {
+    const tz = await getTenantTimezone(this.prisma, tenantId);
     const [product, currentCost] = await Promise.all([
       this.findActiveOrThrow(id, tenantId),
-      this.resolveCurrentCost(tenantId, id, endOfLocalTodayUtc()),
+      this.resolveCurrentCost(tenantId, id, endOfTodayInTimeZoneUtc(tz)),
     ]);
     return this.toItem(product, currentCost);
   }
@@ -191,18 +166,20 @@ export class ProductsService {
         isReturnable: dto.isReturnable ?? true,
         containerType: dto.containerType?.trim() || null,
         isActive: dto.isActive ?? true,
+        reorderLevel: dto.reorderLevel ?? null,
       },
     });
 
     let currentCost: number | null = null;
     if (dto.initialCostPerUnit !== undefined) {
+      const tz = await getTenantTimezone(this.prisma, tenantId);
       const [cost] = await Promise.all([
         this.prisma.productCostHistory.create({
           data: {
             tenantId,
             productId: product.id,
             costPerUnit: dto.initialCostPerUnit,
-            effectiveFrom: startOfLocalTodayUtc(),
+            effectiveFrom: startOfTodayInTimeZoneUtc(tz),
             notes: 'Initial cost',
             createdById: actorId,
           },
@@ -314,6 +291,7 @@ export class ProductsService {
           ? { containerType: dto.containerType?.trim() || null }
           : {}),
         ...(dto.isActive !== undefined ? { isActive: dto.isActive } : {}),
+        ...(dto.reorderLevel !== undefined ? { reorderLevel: dto.reorderLevel } : {}),
       },
     });
 
@@ -332,7 +310,11 @@ export class ProductsService {
         },
         newValue: dto as unknown as Record<string, unknown>,
       }),
-      this.resolveCurrentCost(tenantId, id, endOfLocalTodayUtc()),
+      this.resolveCurrentCost(
+        tenantId,
+        id,
+        endOfTodayInTimeZoneUtc(await getTenantTimezone(this.prisma, tenantId)),
+      ),
     ]);
 
     return this.toItem(updated, currentCost);
@@ -381,9 +363,10 @@ export class ProductsService {
   ): Promise<ProductCostItem> {
     await this.findActiveOrThrow(productId, tenantId);
 
+    const tz = await getTenantTimezone(this.prisma, tenantId);
     const effectiveFrom = dto.effectiveFrom
       ? parseCalendarDateUtc(dto.effectiveFrom, false)
-      : startOfLocalTodayUtc();
+      : startOfTodayInTimeZoneUtc(tz);
     if (Number.isNaN(effectiveFrom.getTime())) {
       throw new BadRequestException('Invalid effectiveFrom date');
     }
@@ -420,7 +403,8 @@ export class ProductsService {
     tenantId: string,
     date?: string,
   ): Promise<{ productId: string; date: string; costPerUnit: number | null }> {
-    const asOf = date ? parseCalendarDateUtc(date, true) : endOfLocalTodayUtc();
+    const tz = await getTenantTimezone(this.prisma, tenantId);
+    const asOf = date ? parseCalendarDateUtc(date, true) : endOfTodayInTimeZoneUtc(tz);
     if (Number.isNaN(asOf.getTime())) {
       throw new BadRequestException('Invalid date');
     }
@@ -524,6 +508,7 @@ export class ProductsService {
       packLabel: string | null;
       containerCapacity: Prisma.Decimal | null;
       allowFractionalQty: boolean;
+      reorderLevel: Prisma.Decimal | null;
       createdAt: Date;
       updatedAt: Date;
     },
@@ -546,6 +531,7 @@ export class ProductsService {
       containerCapacity: decimalToNumber(product.containerCapacity),
       allowFractionalQty: product.allowFractionalQty,
       hasPackHelper: product.unitsPerPack != null && product.unitsPerPack > 0,
+      reorderLevel: product.reorderLevel == null ? null : Number(product.reorderLevel.toString()),
       createdAt: product.createdAt,
       updatedAt: product.updatedAt,
       currentCost,

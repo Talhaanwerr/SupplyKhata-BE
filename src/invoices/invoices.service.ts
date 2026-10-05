@@ -17,6 +17,12 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AuditLogsService } from '../audit-logs/audit-logs.service';
 import { assertInvoicesEnabled } from '../common/helpers/invoices.helper';
 import { getPaginationParams, buildPaginationMeta } from '../common/helpers/pagination.helper';
+import {
+  endOfZonedDayUtc,
+  parseCalendarDateUtc,
+  startOfZonedDayUtc,
+} from '../common/helpers/calendar-utc.helper';
+import { getTenantTimezone } from '../common/helpers/tenant-timezone.helper';
 import { PaginationMeta } from '../common/types/api-response.type';
 import { GenerateInvoiceDto } from './dto/generate-invoice.dto';
 import { ListInvoicesQueryDto } from './dto/list-invoices-query.dto';
@@ -48,7 +54,7 @@ const BILLABLE_ORDER_STATUSES: OrderStatus[] = [
 /**
  * DOCUMENT — Order period filter (v1):
  * Prefer the first OrderStatusEvent where toStatus=PLACED and `at` is in
- * [periodStart, periodEnd] (inclusive, Asia/Karachi date-only bounds).
+ * [periodStart, periodEnd] (inclusive, tenant-timezone wall-clock bounds).
  * If no PLACED event exists, fall back to order.createdAt in that range AND
  * status is billable (PLACED | SHIPPED | PARTIALLY_DELIVERED | DELIVERED).
  */
@@ -78,34 +84,11 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
-/**
- * Parse YYYY-MM-DD as start-of-day Asia/Karachi (UTC+5, no DST).
- * Stored/compared as absolute instants matching date-only intent.
- */
-function startOfDayKarachi(isoDate: string): Date {
-  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(isoDate.trim());
-  if (!m) throw new BadRequestException('Invalid date');
-  const y = Number(m[1]);
-  const mo = Number(m[2]);
-  const d = Number(m[3]);
-  // Asia/Karachi = UTC+5 → local midnight = UTC 19:00 previous day
-  return new Date(Date.UTC(y, mo - 1, d, 0, 0, 0, 0) - 5 * 60 * 60 * 1000);
-}
-
-function endOfDayKarachi(isoDate: string): Date {
-  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(isoDate.trim());
-  if (!m) throw new BadRequestException('Invalid date');
-  const y = Number(m[1]);
-  const mo = Number(m[2]);
-  const d = Number(m[3]);
-  return new Date(Date.UTC(y, mo - 1, d, 23, 59, 59, 999) - 5 * 60 * 60 * 1000);
-}
-
 /** Date-only @db.Date value (UTC noon) for periodStart/periodEnd columns. */
 function toDateOnly(isoDate: string): Date {
-  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(isoDate.trim());
-  if (!m) throw new BadRequestException('Invalid date');
-  return new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 12, 0, 0, 0));
+  const d = parseCalendarDateUtc(isoDate, false);
+  if (Number.isNaN(d.getTime())) throw new BadRequestException('Invalid date');
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 12, 0, 0, 0));
 }
 
 function dateOnlyKey(d: Date): string {
@@ -190,8 +173,9 @@ export class InvoicesService {
       throw new BadRequestException('periodEnd must be on or after periodStart');
     }
 
-    const periodStartBound = startOfDayKarachi(dto.periodStart);
-    const periodEndBound = endOfDayKarachi(dto.periodEnd);
+    const tz = await getTenantTimezone(this.prisma, tenantId);
+    const periodStartBound = startOfZonedDayUtc(dto.periodStart, tz);
+    const periodEndBound = endOfZonedDayUtc(dto.periodEnd, tz);
     const periodStartDate = toDateOnly(dto.periodStart);
     const periodEndDate = toDateOnly(dto.periodEnd);
 

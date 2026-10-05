@@ -12,8 +12,12 @@ import {
   DateRangeQueryDto,
   ExpensesReportQueryDto,
   MonthlySummaryQueryDto,
+  ProductionYieldQueryDto,
+  PurchasesByVendorQueryDto,
+  RawConsumptionQueryDto,
   ReportExportQueryDto,
   RiderCollectionQueryDto,
+  StockOnHandQueryDto,
   VehiclePerformanceQueryDto,
   CollectionPerformanceQueryDto,
 } from './dto/reports-query.dto';
@@ -87,6 +91,30 @@ export class ReportsController {
   @RequirePermissions('reports:read')
   expenses(@Query() query: ExpensesReportQueryDto, @CurrentTenant() tenantId: string) {
     return this.reportsService.expensesReport(tenantId, query);
+  }
+
+  @Get('stock-on-hand')
+  @RequirePermissions('reports:read')
+  stockOnHand(@Query() query: StockOnHandQueryDto, @CurrentTenant() tenantId: string) {
+    return this.reportsService.stockOnHand(tenantId, query);
+  }
+
+  @Get('purchases-by-vendor')
+  @RequirePermissions('reports:read')
+  purchasesByVendor(@Query() query: PurchasesByVendorQueryDto, @CurrentTenant() tenantId: string) {
+    return this.reportsService.purchasesByVendor(tenantId, query);
+  }
+
+  @Get('production-yield')
+  @RequirePermissions('reports:read')
+  productionYield(@Query() query: ProductionYieldQueryDto, @CurrentTenant() tenantId: string) {
+    return this.reportsService.productionYield(tenantId, query);
+  }
+
+  @Get('raw-consumption')
+  @RequirePermissions('reports:read')
+  rawConsumption(@Query() query: RawConsumptionQueryDto, @CurrentTenant() tenantId: string) {
+    return this.reportsService.rawConsumption(tenantId, query);
   }
 
   @Get('export')

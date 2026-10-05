@@ -6,12 +6,14 @@ import {
   OrderStatus as PrismaOrderStatus,
   PaymentMethod as PrismaPaymentMethod,
   Prisma,
+  StockMovementType,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditLogsService } from '../audit-logs/audit-logs.service';
 import { getPaginationParams, buildPaginationMeta } from '../common/helpers/pagination.helper';
 import { clearPromisedDueIfSettled } from '../common/helpers/promised-due.helper';
 import { assertOrdersEnabled } from '../common/helpers/orders.helper';
+import { isInventoryEnabled } from '../common/helpers/inventory.helper';
 import {
   computeOrderTotals,
   decimalToNumber,
@@ -27,6 +29,7 @@ import {
 } from '../common/helpers/returnable-containers.helper';
 import { PaginatedData } from '../common/types/api-response.type';
 import { OrderPaymentStatus, OrderStatus, PaymentMethod } from '../common/enums/delivery.enum';
+import { InventoryService } from '../inventory/inventory.service';
 import { CreateOrderDto } from './dto/create-order.dto';
 import { CreateOrderItemDto } from './dto/create-order-item.dto';
 import { UpdateOrderDto } from './dto/update-order.dto';
@@ -36,6 +39,15 @@ import { DeliverOrderDto } from './dto/deliver-order.dto';
 import { CancelOrderDto } from './dto/cancel-order.dto';
 import { RecordOrderPaymentDto } from './dto/record-order-payment.dto';
 import { RefundOrderDto } from './dto/refund-order.dto';
+import {
+  endOfTodayInTimeZoneUtc,
+  parseCalendarDateUtc,
+} from '../common/helpers/calendar-utc.helper';
+import { getTenantTimezone } from '../common/helpers/tenant-timezone.helper';
+
+/** Soft ref on StockMovement for Orders channel SALE_OUT. */
+const ORDER_STOCK_REF = 'CustomerOrder';
+const ORDER_SALE_OUT_REASON = 'Order sale';
 
 type DbClient = Prisma.TransactionClient | PrismaService;
 
@@ -52,6 +64,8 @@ type ResolvedLine = {
 
 /**
  * Orders channel — standalone from DeliveryRun / Delivery / PlannedStop.
+ * Warehouse SALE_OUT on place when inventory ON (non-truck). No DeliveryRun FK in v1 —
+ * if a future link exists, skip SALE_OUT so truck-loaded stock is not deducted twice.
  * Returnable packaging tracked when returnable-containers flag is ON.
  */
 @Injectable()
@@ -59,7 +73,16 @@ export class OrdersService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditLogsService,
+    private readonly inventory: InventoryService,
   ) {}
+
+  /**
+   * v1 detection: CustomerOrder has no DeliveryRun / Delivery FK → always non-truck.
+   * Future: return true when order is assigned/fulfilled on a loaded delivery run.
+   */
+  private isFulfilledViaDeliveryRun(_order: { id: string }): boolean {
+    return false;
+  }
 
   async create(tenantId: string, dto: CreateOrderDto, actorId: string) {
     await assertOrdersEnabled(this.prisma, tenantId);
@@ -375,7 +398,8 @@ export class OrdersService {
       throw new BadRequestException('Order has no items');
     }
 
-    const today = this.startOfDay(new Date());
+    const tz = await getTenantTimezone(this.prisma, tenantId);
+    const asOf = endOfTodayInTimeZoneUtc(tz);
     const productIds = existing.items.map((i) => i.productId);
     const [products, costRows] = await Promise.all([
       this.prisma.product.findMany({
@@ -386,9 +410,9 @@ export class OrdersService {
         where: {
           tenantId,
           productId: { in: productIds },
-          effectiveFrom: { lte: today },
+          effectiveFrom: { lte: asOf },
         },
-        orderBy: { effectiveFrom: 'desc' },
+        orderBy: [{ effectiveFrom: 'desc' }, { createdAt: 'desc' }],
         select: { productId: true, costPerUnit: true },
       }),
     ]);
@@ -404,7 +428,7 @@ export class OrdersService {
         throw new BadRequestException('One or more products are invalid for this workspace');
       }
       const cost = item.costSnapshot ?? costMap.get(item.productId) ?? null;
-      if (!cost) {
+      if (cost == null) {
         throw new BadRequestException(
           `Missing product cost history for "${product.name}" — required to place order`,
         );
@@ -423,6 +447,12 @@ export class OrdersService {
     const amountPaid = decimalToNumber(existing.amountPaid);
     const amountDue = roundMoney(Math.max(0, totals.total - amountPaid));
     const paymentStatus = recomputePaymentStatus(amountPaid, totals.total);
+
+    const inventoryOn = await isInventoryEnabled(this.prisma, tenantId);
+    const skipWarehouseSaleOut = !inventoryOn || this.isFulfilledViaDeliveryRun(existing);
+    const saleLocation = !skipWarehouseSaleOut
+      ? await this.inventory.ensureDefaultLocation(tenantId)
+      : null;
 
     await this.prisma.$transaction(async (tx) => {
       for (const item of existing.items) {
@@ -444,7 +474,7 @@ export class OrdersService {
         },
       });
 
-      // Post ORDER_SALE debit for order total (includes deliveryCharges). No stock reserve in v1.
+      // Post ORDER_SALE debit for order total (includes deliveryCharges).
       await tx.customerLedgerEntry.create({
         data: {
           tenantId,
@@ -456,6 +486,21 @@ export class OrdersService {
           notes: `Order #${existing.orderNumber}`,
         },
       });
+
+      // Non-truck path: warehouse SALE_OUT when inventory ON (not DeliveryRun load).
+      if (!skipWarehouseSaleOut && saleLocation) {
+        await this.postOrderSaleOut(tx, {
+          tenantId,
+          locationId: saleLocation.id,
+          orderId: id,
+          actorId,
+          lines: existing.items.map((item) => ({
+            productId: item.productId,
+            qty: decimalToNumber(item.quantity),
+            productName: productMap.get(item.productId)?.name,
+          })),
+        });
+      }
 
       await this.writeStatusEvent(tx, {
         tenantId,
@@ -474,7 +519,12 @@ export class OrdersService {
       action: 'PLACE',
       entityId: id,
       oldValue: { status: OrderStatus.DRAFT },
-      newValue: { status: OrderStatus.PLACED, total: totals.total },
+      newValue: {
+        status: OrderStatus.PLACED,
+        total: totals.total,
+        warehouseSaleOut: !skipWarehouseSaleOut,
+        saleLocationId: saleLocation?.id ?? null,
+      },
     });
 
     return this.findOne(id, tenantId);
@@ -767,6 +817,9 @@ export class OrdersService {
             })),
           });
         }
+
+        // Reverse warehouse SALE_OUT posted at place (inventory ON).
+        await this.reverseOrderSaleOut(tx, tenantId, id);
       }
 
       await tx.customerOrder.update({
@@ -796,7 +849,11 @@ export class OrdersService {
       action: 'CANCEL',
       entityId: id,
       oldValue: { status: fromStatus },
-      newValue: { status: OrderStatus.CANCELLED, reason: dto.reason },
+      newValue: {
+        status: OrderStatus.CANCELLED,
+        reason: dto.reason,
+        warehouseSaleOutReversed: fromStatus === PrismaOrderStatus.PLACED,
+      },
     });
 
     return this.findOne(id, tenantId);
@@ -1068,7 +1125,8 @@ export class OrdersService {
       throw new BadRequestException('Duplicate products in order lines are not allowed');
     }
 
-    const today = this.startOfDay(new Date());
+    const tz = await getTenantTimezone(this.prisma, tenantId);
+    const asOf = endOfTodayInTimeZoneUtc(tz);
     const containersEnabled = await isReturnableContainersEnabled(this.prisma, tenantId);
     const [products, prices, costRows] = await Promise.all([
       this.prisma.product.findMany({
@@ -1091,9 +1149,9 @@ export class OrdersService {
         where: {
           tenantId,
           productId: { in: productIds },
-          effectiveFrom: { lte: today },
+          effectiveFrom: { lte: asOf },
         },
-        orderBy: { effectiveFrom: 'desc' },
+        orderBy: [{ effectiveFrom: 'desc' }, { createdAt: 'desc' }],
         select: { productId: true, costPerUnit: true },
       }),
     ]);
@@ -1160,6 +1218,127 @@ export class OrdersService {
     return resolved;
   }
 
+  /** Aggregate qty by product and post SALE_OUT (signed negative). Reject short stock. */
+  private async postOrderSaleOut(
+    tx: Prisma.TransactionClient,
+    args: {
+      tenantId: string;
+      locationId: string;
+      orderId: string;
+      actorId: string;
+      lines: Array<{ productId: string; qty: number; productName?: string }>;
+    },
+  ) {
+    const qtyByProduct = new Map<string, { qty: number; name: string }>();
+    for (const line of args.lines) {
+      if (!(line.qty > 0)) continue;
+      const prev = qtyByProduct.get(line.productId);
+      qtyByProduct.set(line.productId, {
+        qty: (prev?.qty ?? 0) + line.qty,
+        name: line.productName ?? prev?.name ?? 'product',
+      });
+    }
+
+    for (const [productId, { qty, name }] of qtyByProduct) {
+      const dec = new Prisma.Decimal(qty);
+      const balance = await tx.stockBalance.findUnique({
+        where: {
+          tenantId_locationId_productId: {
+            tenantId: args.tenantId,
+            locationId: args.locationId,
+            productId,
+          },
+        },
+      });
+      const current = balance ? new Prisma.Decimal(balance.quantity) : new Prisma.Decimal(0);
+      const next = current.sub(dec);
+      if (next.lessThan(0)) {
+        throw new BadRequestException(
+          `Cannot place order — only ${decimalToNumber(current)} available for "${name}" at warehouse`,
+        );
+      }
+
+      if (balance) {
+        await tx.stockBalance.update({
+          where: { id: balance.id },
+          data: { quantity: next },
+        });
+      } else {
+        await tx.stockBalance.create({
+          data: {
+            tenantId: args.tenantId,
+            locationId: args.locationId,
+            productId,
+            quantity: next,
+          },
+        });
+      }
+
+      await tx.stockMovement.create({
+        data: {
+          tenantId: args.tenantId,
+          locationId: args.locationId,
+          productId,
+          type: StockMovementType.SALE_OUT,
+          quantity: dec.neg(),
+          reason: ORDER_SALE_OUT_REASON,
+          referenceType: ORDER_STOCK_REF,
+          referenceId: args.orderId,
+          createdByUserId: args.actorId,
+        },
+      });
+    }
+  }
+
+  /** Restore balances and remove SALE_OUT rows for a cancelled PLACED order. */
+  private async reverseOrderSaleOut(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    orderId: string,
+  ) {
+    const outs = await tx.stockMovement.findMany({
+      where: {
+        tenantId,
+        referenceType: ORDER_STOCK_REF,
+        referenceId: orderId,
+        type: StockMovementType.SALE_OUT,
+      },
+    });
+
+    for (const m of outs) {
+      const restore = new Prisma.Decimal(m.quantity).neg();
+      const balance = await tx.stockBalance.findUnique({
+        where: {
+          tenantId_locationId_productId: {
+            tenantId,
+            locationId: m.locationId,
+            productId: m.productId,
+          },
+        },
+      });
+      const current = balance ? new Prisma.Decimal(balance.quantity) : new Prisma.Decimal(0);
+      const next = current.add(restore);
+
+      if (balance) {
+        await tx.stockBalance.update({
+          where: { id: balance.id },
+          data: { quantity: next },
+        });
+      } else {
+        await tx.stockBalance.create({
+          data: {
+            tenantId,
+            locationId: m.locationId,
+            productId: m.productId,
+            quantity: next,
+          },
+        });
+      }
+
+      await tx.stockMovement.delete({ where: { id: m.id } });
+    }
+  }
+
   private async writeStatusEvent(
     tx: DbClient,
     data: {
@@ -1221,21 +1400,23 @@ export class OrdersService {
   }
 
   private parseDateOnly(value: string): Date {
-    const d = this.parseDate(value);
-    d.setHours(0, 0, 0, 0);
+    const d = parseCalendarDateUtc(value, false);
+    if (Number.isNaN(d.getTime())) {
+      throw new BadRequestException('Invalid date');
+    }
     return d;
   }
 
   private endOfDay(value: string): Date {
-    const d = this.parseDate(value);
-    d.setHours(23, 59, 59, 999);
+    const d = parseCalendarDateUtc(value, true);
+    if (Number.isNaN(d.getTime())) {
+      throw new BadRequestException('Invalid date');
+    }
     return d;
   }
 
   private startOfDay(d: Date): Date {
-    const copy = new Date(d);
-    copy.setHours(0, 0, 0, 0);
-    return copy;
+    return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, 0, 0, 0));
   }
 
   private listInclude() {

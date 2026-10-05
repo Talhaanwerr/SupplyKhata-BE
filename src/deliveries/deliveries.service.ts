@@ -24,6 +24,7 @@ import { DeliveryStatus } from '../common/enums/delivery.enum';
 import { CreateDeliveryDto } from './dto/create-delivery.dto';
 import { ListDeliveriesQueryDto } from './dto/list-deliveries-query.dto';
 import { SchedulingService } from '../scheduling/scheduling.service';
+import { parseCalendarDateUtc } from '../common/helpers/calendar-utc.helper';
 
 type DecimalLike = Prisma.Decimal | number | null | undefined;
 
@@ -33,7 +34,7 @@ function decimalToNumber(value: DecimalLike): number {
 }
 
 function parseDate(value: string): Date {
-  const parsed = new Date(value);
+  const parsed = parseCalendarDateUtc(value, false);
   if (Number.isNaN(parsed.getTime())) {
     throw new BadRequestException('Invalid date');
   }
@@ -41,15 +42,11 @@ function parseDate(value: string): Date {
 }
 
 function endOfDay(value: string): Date {
-  const d = parseDate(value);
-  d.setHours(23, 59, 59, 999);
+  const d = parseCalendarDateUtc(value, true);
+  if (Number.isNaN(d.getTime())) {
+    throw new BadRequestException('Invalid date');
+  }
   return d;
-}
-
-function startOfDayLocal(d: Date): Date {
-  const copy = new Date(d);
-  copy.setHours(0, 0, 0, 0);
-  return copy;
 }
 
 @Injectable()
@@ -63,11 +60,12 @@ export class DeliveriesService {
   async create(tenantId: string, dto: CreateDeliveryDto, actorId: string) {
     this.assertItems(dto.items);
     const deliveryDate = parseDate(dto.deliveryDate);
+    const costAsOf = parseCalendarDateUtc(dto.deliveryDate, true);
 
     let promisedPayDate: Date | null = null;
     if (dto.promisedPayDate) {
       promisedPayDate = parseDate(dto.promisedPayDate);
-      if (startOfDayLocal(promisedPayDate).getTime() < startOfDayLocal(deliveryDate).getTime()) {
+      if (promisedPayDate.getTime() < deliveryDate.getTime()) {
         throw new BadRequestException('Promised pay date cannot be before delivery date');
       }
     }
@@ -81,7 +79,8 @@ export class DeliveriesService {
 
     const productIds = dto.items.map((item) => item.productId);
 
-    // Resolve lookups outside the interactive tx — only stock assert + writes stay inside.
+    // Resolve lookups outside the interactive tx — only truck stock assert + writes stay inside.
+    // DeliveryRunStock (OPENING/CLOSING) ≠ warehouse StockBalance. Do not call inventory SALE_OUT here.
     const [run, customer, products, prices, costRows, containersEnabled] = await Promise.all([
       this.prisma.deliveryRun.findFirst({
         where: { id: dto.deliveryRunId, tenantId },
@@ -111,9 +110,9 @@ export class DeliveriesService {
         where: {
           tenantId,
           productId: { in: productIds },
-          effectiveFrom: { lte: deliveryDate },
+          effectiveFrom: { lte: costAsOf },
         },
-        orderBy: { effectiveFrom: 'desc' },
+        orderBy: [{ effectiveFrom: 'desc' }, { createdAt: 'desc' }],
         select: { productId: true, costPerUnit: true },
       }),
       isReturnableContainersEnabled(this.prisma, tenantId),

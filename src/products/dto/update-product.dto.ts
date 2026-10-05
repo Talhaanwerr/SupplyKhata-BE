@@ -97,4 +97,12 @@ export class UpdateProductDto {
   @IsOptional()
   @IsBoolean()
   isActive?: boolean;
+
+  /** Low-stock threshold (base units). Null clears. Used when inventory flag is ON. */
+  @ApiPropertyOptional({ example: 10, nullable: true })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber({ maxDecimalPlaces: 3 })
+  @Min(0)
+  reorderLevel?: number | null;
 }

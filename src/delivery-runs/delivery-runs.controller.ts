@@ -12,6 +12,7 @@ import { CreateDeliveryRunDto } from './dto/create-delivery-run.dto';
 import { CloseDeliveryRunDto } from './dto/close-delivery-run.dto';
 import { UpdateDeliveryRunDto } from './dto/update-delivery-run.dto';
 import { ListDeliveryRunsQueryDto } from './dto/list-delivery-runs-query.dto';
+import { WarehouseAvailabilityQueryDto } from './dto/warehouse-availability-query.dto';
 import { IncludePlannedStopsDto } from '../scheduling/dto/planned-stops.dto';
 
 @UseGuards(JwtAuthGuard, TenantGuard, PermissionsGuard)
@@ -36,6 +37,16 @@ export class DeliveryRunsController {
   @RequirePermissions('deliveryruns:read')
   list(@Query() query: ListDeliveryRunsQueryDto, @CurrentTenant() tenantId: string) {
     return this.deliveryRunsService.list(tenantId, query);
+  }
+
+  /** Static path — must stay above `:id` so Nest does not treat it as a run id. */
+  @Get('warehouse-availability')
+  @RequirePermissions('deliveryruns:read')
+  warehouseAvailability(
+    @Query() query: WarehouseAvailabilityQueryDto,
+    @CurrentTenant() tenantId: string,
+  ) {
+    return this.deliveryRunsService.warehouseAvailability(tenantId, query);
   }
 
   @Get(':id')

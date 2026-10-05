@@ -3,6 +3,7 @@ import {
   DeliveryStatus as PrismaDeliveryStatus,
   Prisma,
   RunStatus as PrismaRunStatus,
+  StockMovementType,
   StockType as PrismaStockType,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
@@ -10,10 +11,12 @@ import { AuditLogsService } from '../audit-logs/audit-logs.service';
 import { getPaginationParams, buildPaginationMeta } from '../common/helpers/pagination.helper';
 import { PaginatedData } from '../common/types/api-response.type';
 import { RunStatus, StockType } from '../common/enums/delivery.enum';
+import { parseCalendarDateUtc } from '../common/helpers/calendar-utc.helper';
 import { CreateDeliveryRunDto } from './dto/create-delivery-run.dto';
 import { CloseDeliveryRunDto } from './dto/close-delivery-run.dto';
 import { UpdateDeliveryRunDto } from './dto/update-delivery-run.dto';
 import { ListDeliveryRunsQueryDto } from './dto/list-delivery-runs-query.dto';
+import { WarehouseAvailabilityQueryDto } from './dto/warehouse-availability-query.dto';
 import { DeliveryRunStockDto } from './dto/delivery-run-stock.dto';
 import { DeliveryRunRefillLoadDto } from './dto/delivery-run-refill-load.dto';
 import { assertValidStockQuantity, decimalQtyToNumber } from '../common/helpers/product-qty.helper';
@@ -25,6 +28,12 @@ import {
   isReturnableContainersEnabled,
   resolveFilledPackagingCount,
 } from '../common/helpers/returnable-containers.helper';
+import { assertInventoryEnabled, isInventoryEnabled } from '../common/helpers/inventory.helper';
+import { InventoryService } from '../inventory/inventory.service';
+
+const DELIVERY_RUN_REF = 'DeliveryRun';
+const TRUCK_LOAD_REASON = 'Truck load';
+const TRUCK_RETURN_REASON = 'Leftover return';
 
 type DecimalLike = Prisma.Decimal | number | null | undefined;
 
@@ -34,7 +43,7 @@ function decimalToNumber(value: DecimalLike): number {
 }
 
 function parseDate(value: string): Date {
-  const parsed = new Date(value);
+  const parsed = parseCalendarDateUtc(value, false);
   if (Number.isNaN(parsed.getTime())) {
     throw new BadRequestException('Invalid date');
   }
@@ -42,8 +51,10 @@ function parseDate(value: string): Date {
 }
 
 function endOfDay(value: string): Date {
-  const d = parseDate(value);
-  d.setHours(23, 59, 59, 999);
+  const d = parseCalendarDateUtc(value, true);
+  if (Number.isNaN(d.getTime())) {
+    throw new BadRequestException('Invalid date');
+  }
   return d;
 }
 
@@ -52,6 +63,7 @@ export class DeliveryRunsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditLogsService,
+    private readonly inventory: InventoryService,
   ) {}
 
   async create(tenantId: string, dto: CreateDeliveryRunDto, actorId: string) {
@@ -60,6 +72,7 @@ export class DeliveryRunsService {
     const refillLoads = dto.refillLoads ?? [];
     const plantFillEnabled = await isPlantFillEnabled(this.prisma, tenantId);
     assertNoRefillLoadsWhenPlantFillDisabled(plantFillEnabled, refillLoads);
+    const inventoryOn = await isInventoryEnabled(this.prisma, tenantId);
     const productIds = [
       ...new Set([
         ...dto.openingStock.map((stock) => stock.productId),
@@ -73,6 +86,9 @@ export class DeliveryRunsService {
       this.assertVehicle(this.prisma, tenantId, dto.vehicleId),
       this.assertProducts(this.prisma, tenantId, productIds),
     ]);
+    const loadLocation = inventoryOn
+      ? await this.resolveLoadLocation(tenantId, dto.loadLocationId)
+      : null;
     // stock qty + packaging validated when resolving packaging counts below
 
     const runId = await this.prisma.$transaction(
@@ -95,6 +111,7 @@ export class DeliveryRunsService {
             date,
             openingCash: dto.openingCash,
             notes: dto.notes?.trim() || null,
+            loadLocationId: inventoryOn ? loadLocation!.id : dto.loadLocationId?.trim() || null,
             stocks: {
               create: openingStock.map((stock) => ({
                 tenantId,
@@ -121,6 +138,19 @@ export class DeliveryRunsService {
           select: { id: true },
         });
 
+        if (inventoryOn && loadLocation) {
+          await this.postTruckLoadWarehouseOut(tx, {
+            tenantId,
+            locationId: loadLocation.id,
+            runId: created.id,
+            actorId,
+            lines: openingStock.map((stock) => ({
+              productId: stock.productId,
+              qty: stock.filledCount,
+            })),
+          });
+        }
+
         return created.id;
       },
       { maxWait: 10_000, timeout: 20_000 },
@@ -141,6 +171,8 @@ export class DeliveryRunsService {
         riderId: run.riderId,
         vehicleId: run.vehicleId,
         date: run.date,
+        loadLocationId: run.loadLocationId,
+        warehouseTransferOut: inventoryOn,
         refillLoads: refillLoads.map((load) => ({
           refillBatchId: load.refillBatchId,
           productId: load.productId,
@@ -150,6 +182,56 @@ export class DeliveryRunsService {
     });
 
     return this.toDetail(run);
+  }
+
+  /**
+   * Available warehouse qty per product for truck load UI (inventory ON only).
+   * excludeRunId adds back that run’s prior TRANSFER_OUT (edit-opening case).
+   */
+  async warehouseAvailability(tenantId: string, query: WarehouseAvailabilityQueryDto) {
+    await assertInventoryEnabled(this.prisma, tenantId);
+    const location = await this.resolveLoadLocation(tenantId, query.locationId);
+
+    const balances = await this.prisma.stockBalance.findMany({
+      where: { tenantId, locationId: location.id },
+      select: { productId: true, quantity: true },
+    });
+    const available = new Map<string, number>(
+      balances.map((row) => [row.productId, decimalToNumber(row.quantity)]),
+    );
+
+    const excludeRunId = query.excludeRunId?.trim();
+    if (excludeRunId) {
+      const run = await this.prisma.deliveryRun.findFirst({
+        where: { id: excludeRunId, tenantId },
+        select: { id: true },
+      });
+      if (!run) throw new NotFoundException('Delivery run not found');
+
+      const outs = await this.prisma.stockMovement.findMany({
+        where: {
+          tenantId,
+          locationId: location.id,
+          referenceType: DELIVERY_RUN_REF,
+          referenceId: excludeRunId,
+          type: StockMovementType.TRANSFER_OUT,
+        },
+        select: { productId: true, quantity: true },
+      });
+      for (const m of outs) {
+        const addBack = Math.abs(decimalToNumber(m.quantity));
+        available.set(m.productId, (available.get(m.productId) ?? 0) + addBack);
+      }
+    }
+
+    return {
+      locationId: location.id,
+      locationName: location.name,
+      items: [...available.entries()].map(([productId, availableQty]) => ({
+        productId,
+        availableQty,
+      })),
+    };
   }
 
   async list(
@@ -198,20 +280,59 @@ export class DeliveryRunsService {
   }
 
   async update(id: string, tenantId: string, dto: UpdateDeliveryRunDto, actorId: string) {
-    if (dto.openingCash == null && !dto.openingStock && dto.notes === undefined) {
+    if (
+      dto.openingCash == null &&
+      !dto.openingStock &&
+      dto.notes === undefined &&
+      dto.loadLocationId === undefined
+    ) {
       throw new BadRequestException('Nothing to update');
     }
     if (dto.openingStock) this.assertUniqueProducts(dto.openingStock);
 
+    const inventoryOn = await isInventoryEnabled(this.prisma, tenantId);
+    const warehouseAffecting = !!dto.openingStock || dto.loadLocationId !== undefined;
+    const resolvedLocation =
+      inventoryOn && warehouseAffecting
+        ? await this.resolveLoadLocation(
+            tenantId,
+            dto.loadLocationId !== undefined
+              ? dto.loadLocationId
+              : (
+                  await this.prisma.deliveryRun.findFirst({
+                    where: { id, tenantId },
+                    select: { loadLocationId: true },
+                  })
+                )?.loadLocationId,
+          )
+        : null;
+
     const updated = await this.prisma.$transaction(async (tx) => {
       const run = await tx.deliveryRun.findFirst({
         where: { id, tenantId },
-        select: { id: true, status: true },
+        select: { id: true, status: true, loadLocationId: true },
       });
       if (!run) throw new NotFoundException('Delivery run not found');
       if (run.status !== PrismaRunStatus.OPEN) {
         throw new BadRequestException('Only open delivery runs can be edited');
       }
+
+      if (inventoryOn && warehouseAffecting) {
+        const deliveriesCount = await tx.delivery.count({
+          where: {
+            tenantId,
+            deliveryRunId: id,
+            status: { not: PrismaDeliveryStatus.CANCELLED },
+          },
+        });
+        if (deliveriesCount > 0) {
+          throw new BadRequestException(
+            'Cannot change opening stock or load location after deliveries when inventory is enabled',
+          );
+        }
+      }
+
+      let openingStockForWarehouse: Array<{ productId: string; filledCount: number }> | null = null;
 
       if (dto.openingStock) {
         await this.assertProducts(
@@ -221,6 +342,10 @@ export class DeliveryRunsService {
         );
         const openingStock = await this.withPackagingCounts(tx, tenantId, dto.openingStock);
         await this.assertOpeningStockNotBelowDelivered(tx, tenantId, id, openingStock);
+        openingStockForWarehouse = openingStock.map((stock) => ({
+          productId: stock.productId,
+          filledCount: stock.filledCount,
+        }));
 
         for (const stock of openingStock) {
           await tx.deliveryRunStock.upsert({
@@ -249,11 +374,46 @@ export class DeliveryRunsService {
         }
       }
 
+      if (inventoryOn && warehouseAffecting && resolvedLocation) {
+        await this.reverseTruckLoadWarehouseOut(tx, tenantId, id);
+
+        if (!openingStockForWarehouse) {
+          const existing = await tx.deliveryRunStock.findMany({
+            where: {
+              tenantId,
+              deliveryRunId: id,
+              stockType: PrismaStockType.OPENING,
+            },
+            select: { productId: true, filledCount: true },
+          });
+          openingStockForWarehouse = existing.map((row) => ({
+            productId: row.productId,
+            filledCount: decimalQtyToNumber(row.filledCount),
+          }));
+        }
+
+        await this.postTruckLoadWarehouseOut(tx, {
+          tenantId,
+          locationId: resolvedLocation.id,
+          runId: id,
+          actorId,
+          lines: openingStockForWarehouse.map((stock) => ({
+            productId: stock.productId,
+            qty: stock.filledCount,
+          })),
+        });
+      }
+
       await tx.deliveryRun.update({
         where: { id },
         data: {
           ...(dto.openingCash != null ? { openingCash: dto.openingCash } : {}),
           ...(dto.notes !== undefined ? { notes: dto.notes?.trim() || null } : {}),
+          ...(inventoryOn && warehouseAffecting && resolvedLocation
+            ? { loadLocationId: resolvedLocation.id }
+            : dto.loadLocationId !== undefined && !inventoryOn
+              ? { loadLocationId: dto.loadLocationId?.trim() || null }
+              : {}),
         },
       });
 
@@ -273,6 +433,8 @@ export class DeliveryRunsService {
         openingCash: dto.openingCash,
         openingStock: dto.openingStock,
         notes: dto.notes,
+        loadLocationId: updated.loadLocationId,
+        warehouseTransferOut: inventoryOn && warehouseAffecting,
       },
     });
 
@@ -281,23 +443,89 @@ export class DeliveryRunsService {
 
   async close(id: string, tenantId: string, dto: CloseDeliveryRunDto, actorId: string) {
     this.assertUniqueProducts(dto.closingStock);
+    const returnLines = (dto.returnToWarehouse ?? []).filter((line) => line.qty > 0);
+    if (returnLines.length > 0) {
+      this.assertUniqueReturnProducts(returnLines);
+      await assertInventoryEnabled(this.prisma, tenantId);
+    }
+    const inventoryOn = await isInventoryEnabled(this.prisma, tenantId);
+    const returnLocation =
+      returnLines.length > 0
+        ? await this.resolveLoadLocation(
+            tenantId,
+            (
+              await this.prisma.deliveryRun.findFirst({
+                where: { id, tenantId },
+                select: { loadLocationId: true },
+              })
+            )?.loadLocationId,
+          )
+        : null;
 
     const closed = await this.prisma.$transaction(async (tx) => {
       const run = await tx.deliveryRun.findFirst({
         where: { id, tenantId },
-        select: { id: true, status: true },
+        select: { id: true, status: true, loadLocationId: true },
       });
       if (!run) throw new NotFoundException('Delivery run not found');
       if (run.status === PrismaRunStatus.CLOSED) {
         throw new BadRequestException('Delivery run is already closed');
       }
 
-      await this.assertProducts(
-        tx,
-        tenantId,
-        dto.closingStock.map((stock) => stock.productId),
-      );
+      const productIds = [
+        ...new Set([
+          ...dto.closingStock.map((stock) => stock.productId),
+          ...returnLines.map((line) => line.productId),
+        ]),
+      ];
+      await this.assertProducts(tx, tenantId, productIds);
       const closingStock = await this.withPackagingCounts(tx, tenantId, dto.closingStock);
+
+      const leftovers = await this.computeLeftoverFilled(tx, tenantId, id);
+      const returnByProduct = new Map(returnLines.map((line) => [line.productId, line.qty]));
+
+      if (returnLines.length > 0) {
+        const products = await tx.product.findMany({
+          where: { tenantId, id: { in: returnLines.map((l) => l.productId) } },
+          select: { id: true, name: true },
+        });
+        const nameById = new Map(products.map((p) => [p.id, p.name]));
+
+        for (const line of returnLines) {
+          const leftover = leftovers.get(line.productId) ?? 0;
+          const name = nameById.get(line.productId) ?? 'product';
+          if (line.qty > leftover + 1e-9) {
+            throw new BadRequestException(
+              `Cannot return ${line.qty} of "${name}" — only ${leftover} leftover on truck`,
+            );
+          }
+        }
+
+        // Closing filled + return must not exceed leftover (avoid double-count).
+        for (const stock of closingStock) {
+          const returned = returnByProduct.get(stock.productId) ?? 0;
+          if (!(returned > 0)) continue;
+          const leftover = leftovers.get(stock.productId) ?? 0;
+          const maxClosing = leftover - returned;
+          if (stock.filledCount > maxClosing + 1e-9) {
+            const name = nameById.get(stock.productId) ?? 'product';
+            throw new BadRequestException(
+              `Closing filled plus return for "${name}" exceeds leftover (${leftover}). Max closing after return: ${Math.max(0, maxClosing)}`,
+            );
+          }
+        }
+
+        await this.postTruckReturnWarehouseIn(tx, {
+          tenantId,
+          locationId: returnLocation!.id,
+          runId: id,
+          actorId,
+          lines: returnLines.map((line) => ({
+            productId: line.productId,
+            qty: line.qty,
+          })),
+        });
+      }
 
       const totals = await this.computeTotals(tx, tenantId, id);
 
@@ -321,6 +549,9 @@ export class DeliveryRunsService {
           totalSales: totals.totalSales,
           totalCashCollected: totals.totalCashCollected,
           totalExpenses: 0,
+          ...(inventoryOn && returnLocation && !run.loadLocationId
+            ? { loadLocationId: returnLocation.id }
+            : {}),
         },
       });
 
@@ -336,7 +567,11 @@ export class DeliveryRunsService {
       module: 'deliveryruns',
       action: 'CLOSE',
       entityId: id,
-      newValue: { closingCash: dto.closingCash },
+      newValue: {
+        closingCash: dto.closingCash,
+        returnToWarehouse: returnLines,
+        warehouseTransferIn: returnLines.length > 0,
+      },
     });
 
     return { run: this.toDetail(closed), summary: await this.summary(id, tenantId) };
@@ -527,6 +762,151 @@ export class DeliveryRunsService {
     }
   }
 
+  private async resolveLoadLocation(tenantId: string, loadLocationId?: string | null) {
+    const defaultLoc = await this.inventory.ensureDefaultLocation(tenantId);
+    const requested = loadLocationId?.trim();
+    if (!requested) return defaultLoc;
+
+    const loc = await this.prisma.stockLocation.findFirst({
+      where: { id: requested, tenantId, isActive: true },
+      select: { id: true, name: true, isDefault: true, type: true, isActive: true },
+    });
+    if (!loc) throw new NotFoundException('Stock location not found');
+    return loc;
+  }
+
+  /**
+   * Remove prior truck-load TRANSFER_OUT for this run and restore warehouse balances.
+   * Safe before first delivery (inventory ON edit path). Never SALE_OUT.
+   */
+  private async reverseTruckLoadWarehouseOut(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    runId: string,
+  ) {
+    const outs = await tx.stockMovement.findMany({
+      where: {
+        tenantId,
+        referenceType: DELIVERY_RUN_REF,
+        referenceId: runId,
+        type: StockMovementType.TRANSFER_OUT,
+      },
+    });
+
+    for (const m of outs) {
+      const restore = new Prisma.Decimal(m.quantity).neg();
+      await this.applyWarehouseBalanceDelta(tx, {
+        tenantId,
+        locationId: m.locationId,
+        productId: m.productId,
+        delta: restore,
+        allowNegative: false,
+        productName: null,
+      });
+      await tx.stockMovement.delete({ where: { id: m.id } });
+    }
+  }
+
+  /** Post warehouse TRANSFER_OUT for opening filled qty (caps ≤ StockBalance). */
+  private async postTruckLoadWarehouseOut(
+    tx: Prisma.TransactionClient,
+    args: {
+      tenantId: string;
+      locationId: string;
+      runId: string;
+      actorId: string;
+      lines: Array<{ productId: string; qty: number }>;
+    },
+  ) {
+    const productIds = [...new Set(args.lines.filter((l) => l.qty > 0).map((l) => l.productId))];
+    const products =
+      productIds.length === 0
+        ? []
+        : await tx.product.findMany({
+            where: { tenantId: args.tenantId, id: { in: productIds } },
+            select: { id: true, name: true },
+          });
+    const nameById = new Map(products.map((p) => [p.id, p.name]));
+
+    for (const line of args.lines) {
+      if (!(line.qty > 0)) continue;
+      const qty = new Prisma.Decimal(line.qty);
+      await this.applyWarehouseBalanceDelta(tx, {
+        tenantId: args.tenantId,
+        locationId: args.locationId,
+        productId: line.productId,
+        delta: qty.neg(),
+        allowNegative: false,
+        productName: nameById.get(line.productId) ?? 'product',
+        loadQty: line.qty,
+      });
+
+      await tx.stockMovement.create({
+        data: {
+          tenantId: args.tenantId,
+          locationId: args.locationId,
+          productId: line.productId,
+          type: StockMovementType.TRANSFER_OUT,
+          quantity: qty.neg(),
+          reason: TRUCK_LOAD_REASON,
+          referenceType: DELIVERY_RUN_REF,
+          referenceId: args.runId,
+          createdByUserId: args.actorId,
+        },
+      });
+    }
+  }
+
+  private async applyWarehouseBalanceDelta(
+    tx: Prisma.TransactionClient,
+    args: {
+      tenantId: string;
+      locationId: string;
+      productId: string;
+      delta: Prisma.Decimal;
+      allowNegative: boolean;
+      productName: string | null;
+      loadQty?: number;
+    },
+  ) {
+    const balance = await tx.stockBalance.findUnique({
+      where: {
+        tenantId_locationId_productId: {
+          tenantId: args.tenantId,
+          locationId: args.locationId,
+          productId: args.productId,
+        },
+      },
+    });
+    const current = balance ? new Prisma.Decimal(balance.quantity) : new Prisma.Decimal(0);
+    const next = current.add(args.delta);
+
+    if (!args.allowNegative && next.lessThan(0)) {
+      const available = decimalToNumber(current);
+      const name = args.productName ?? 'product';
+      const loadQty = args.loadQty ?? Math.abs(decimalToNumber(args.delta));
+      throw new BadRequestException(
+        `Cannot load ${loadQty} of "${name}" — only ${available} available at warehouse`,
+      );
+    }
+
+    if (balance) {
+      await tx.stockBalance.update({
+        where: { id: balance.id },
+        data: { quantity: next },
+      });
+    } else {
+      await tx.stockBalance.create({
+        data: {
+          tenantId: args.tenantId,
+          locationId: args.locationId,
+          productId: args.productId,
+          quantity: next,
+        },
+      });
+    }
+  }
+
   /**
    * Validate base qty + empties, resolve filledPackagingCount (explicit for LTR/KG returnable).
    */
@@ -582,6 +962,97 @@ export class DeliveryRunsService {
     const ids = stock.map((row) => row.productId);
     if (new Set(ids).size !== ids.length) {
       throw new BadRequestException('Each product can appear only once in stock');
+    }
+  }
+
+  private assertUniqueReturnProducts(lines: Array<{ productId: string }>): void {
+    const ids = lines.map((row) => row.productId);
+    if (new Set(ids).size !== ids.length) {
+      throw new BadRequestException('Each product can appear only once in returnToWarehouse');
+    }
+  }
+
+  /** Leftover filled on truck = opening filled − delivered (non-cancelled). */
+  private async computeLeftoverFilled(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    deliveryRunId: string,
+  ): Promise<Map<string, number>> {
+    const [openingStocks, deliveries] = await Promise.all([
+      tx.deliveryRunStock.findMany({
+        where: {
+          tenantId,
+          deliveryRunId,
+          stockType: PrismaStockType.OPENING,
+        },
+        select: { productId: true, filledCount: true },
+      }),
+      tx.delivery.findMany({
+        where: {
+          tenantId,
+          deliveryRunId,
+          status: { not: PrismaDeliveryStatus.CANCELLED },
+        },
+        select: {
+          items: {
+            select: { productId: true, quantityDelivered: true },
+          },
+        },
+      }),
+    ]);
+
+    const leftover = new Map<string, number>();
+    for (const stock of openingStocks) {
+      leftover.set(stock.productId, decimalQtyToNumber(stock.filledCount));
+    }
+    for (const delivery of deliveries) {
+      for (const item of delivery.items) {
+        const current = leftover.get(item.productId) ?? 0;
+        leftover.set(item.productId, current - decimalQtyToNumber(item.quantityDelivered));
+      }
+    }
+    for (const [productId, qty] of leftover) {
+      leftover.set(productId, Math.max(0, qty));
+    }
+    return leftover;
+  }
+
+  /** Post warehouse TRANSFER_IN for leftover return (inventory ON close path). */
+  private async postTruckReturnWarehouseIn(
+    tx: Prisma.TransactionClient,
+    args: {
+      tenantId: string;
+      locationId: string;
+      runId: string;
+      actorId: string;
+      lines: Array<{ productId: string; qty: number }>;
+    },
+  ) {
+    for (const line of args.lines) {
+      if (!(line.qty > 0)) continue;
+      const qty = new Prisma.Decimal(line.qty);
+      await this.applyWarehouseBalanceDelta(tx, {
+        tenantId: args.tenantId,
+        locationId: args.locationId,
+        productId: line.productId,
+        delta: qty,
+        allowNegative: true,
+        productName: null,
+      });
+
+      await tx.stockMovement.create({
+        data: {
+          tenantId: args.tenantId,
+          locationId: args.locationId,
+          productId: line.productId,
+          type: StockMovementType.TRANSFER_IN,
+          quantity: qty,
+          reason: TRUCK_RETURN_REASON,
+          referenceType: DELIVERY_RUN_REF,
+          referenceId: args.runId,
+          createdByUserId: args.actorId,
+        },
+      });
     }
   }
 
@@ -725,6 +1196,7 @@ export class DeliveryRunsService {
     return {
       rider: { select: { id: true, firstName: true, lastName: true, email: true } },
       vehicle: { select: { id: true, name: true, plateNumber: true, type: true } },
+      loadLocation: { select: { id: true, name: true, isDefault: true } },
       stocks: { include: { product: { select: { id: true, name: true } } } },
       refillLoads: {
         include: {
@@ -807,6 +1279,8 @@ export class DeliveryRunsService {
       totalCashCollected: decimalToNumber(row.totalCashCollected),
       totalExpenses: decimalToNumber(row.totalExpenses),
       notes: row.notes,
+      loadLocationId: row.loadLocationId,
+      loadLocation: row.loadLocation,
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
       rider: row.rider,

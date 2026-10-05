@@ -2,6 +2,7 @@ import { Injectable, NotFoundException, BadRequestException } from '@nestjs/comm
 import { Prisma } from '@prisma/client';
 import { CustomerStatus, PaymentCycle } from '../common/enums/customer.enum';
 import { PrismaService } from '../prisma/prisma.service';
+import { parseCalendarDateUtc } from '../common/helpers/calendar-utc.helper';
 import { AuditLogsService } from '../audit-logs/audit-logs.service';
 import { getPaginationParams, buildPaginationMeta } from '../common/helpers/pagination.helper';
 import { PaginatedData } from '../common/types/api-response.type';
@@ -36,8 +37,10 @@ function parseLedgerDate(value: string): Date {
 }
 
 function endOfLedgerDay(value: string): Date {
-  const d = parseLedgerDate(value);
-  d.setHours(23, 59, 59, 999);
+  const d = parseCalendarDateUtc(value, true);
+  if (Number.isNaN(d.getTime())) {
+    throw new BadRequestException('Invalid date');
+  }
   return d;
 }
 
@@ -753,12 +756,17 @@ export class CustomersService {
           'billingAnchorDate is required for WEEKLY and FORTNIGHTLY cycles',
         );
       }
-      const parsed = new Date(billingAnchorDate);
+      const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(billingAnchorDate.trim());
+      const parsed = match
+        ? parseCalendarDateUtc(`${match[1]}-${match[2]}-${match[3]}`, false)
+        : new Date(billingAnchorDate);
       if (Number.isNaN(parsed.getTime())) {
         throw new BadRequestException('Invalid billingAnchorDate');
       }
-      parsed.setHours(0, 0, 0, 0);
-      return { billingDueDate: null, billingAnchorDate: parsed };
+      const billingAnchor = new Date(
+        Date.UTC(parsed.getUTCFullYear(), parsed.getUTCMonth(), parsed.getUTCDate(), 0, 0, 0, 0),
+      );
+      return { billingDueDate: null, billingAnchorDate: billingAnchor };
     }
 
     // MONTHLY / CUSTOM
