@@ -1,4 +1,4 @@
-## SaaS Boilerplate — NestJS Backend
+# SupplyKhata — NestJS Backend
 
 Production-ready multi-tenant SaaS backend built with NestJS, Prisma, MySQL, and TypeScript.
 

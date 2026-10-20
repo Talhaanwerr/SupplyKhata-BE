@@ -12,12 +12,12 @@ import {
 } from 'class-validator';
 
 export class ContainerOpeningItemDto {
-  @ApiProperty()
+  @ApiProperty({ description: 'Shared packaging type (e.g. 20L Can)' })
   @IsString()
   @MinLength(1)
-  productId!: string;
+  packagingTypeId!: string;
 
-  @ApiProperty({ example: 60, description: 'Absolute owned fleet opening for this product' })
+  @ApiProperty({ example: 60, description: 'Absolute owned fleet opening for this packaging type' })
   @Type(() => Number)
   @IsInt()
   @Min(0)

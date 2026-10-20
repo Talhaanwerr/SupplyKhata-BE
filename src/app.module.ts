@@ -26,6 +26,7 @@ import { RefillBatchesModule } from './refill-batches/refill-batches.module';
 import { ExpensesModule } from './expenses/expenses.module';
 import { CashHandoversModule } from './cash-handovers/cash-handovers.module';
 import { ContainerInventoryModule } from './container-inventory/container-inventory.module';
+import { PackagingTypesModule } from './packaging-types/packaging-types.module';
 import { DashboardModule } from './dashboard/dashboard.module';
 import { ReportsModule } from './reports/reports.module';
 import { CollectionsModule } from './collections/collections.module';
@@ -87,6 +88,7 @@ import { winstonConfig } from './config/logger.config';
     ExpensesModule,
     CashHandoversModule,
     ContainerInventoryModule,
+    PackagingTypesModule,
     DashboardModule,
     ReportsModule,
     CollectionsModule,

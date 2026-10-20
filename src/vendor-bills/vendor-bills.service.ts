@@ -2,11 +2,14 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { Prisma, VendorBillStatus, VendorLedgerEntryType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditLogsService } from '../audit-logs/audit-logs.service';
+import { NotificationsService } from '../notifications/notifications.service';
+import { NotificationType } from '../notifications/dto/create-notification.dto';
 import { getPaginationParams, buildPaginationMeta } from '../common/helpers/pagination.helper';
 import {
   assertVendorBillsEnabled,
   isVendorBillsEnabled,
 } from '../common/helpers/vendor-bills.helper';
+import { lockVendorBill } from '../common/helpers/stock-lock.helper';
 import {
   CreateVendorBillDto,
   ListVendorBillsQueryDto,
@@ -68,6 +71,7 @@ export class VendorBillsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditLogsService,
+    private readonly notifications: NotificationsService,
   ) {}
 
   async list(tenantId: string, query: ListVendorBillsQueryDto) {
@@ -238,22 +242,27 @@ export class VendorBillsService {
 
   async pay(id: string, tenantId: string, dto: PayVendorBillDto, actorId: string) {
     await assertVendorBillsEnabled(this.prisma, tenantId);
-    const bill = await this.requireBill(tenantId, id, true);
 
-    if (bill.status === VendorBillStatus.VOID || bill.status === VendorBillStatus.PAID) {
-      throw new BadRequestException('This bill cannot accept payments');
-    }
-
-    const remaining = new Prisma.Decimal(bill.totalAmount).sub(bill.paidAmount);
     const payAmt = roundMoney(dto.amount);
     if (payAmt.lessThanOrEqualTo(0)) {
       throw new BadRequestException('Payment amount must be greater than 0');
     }
-    if (payAmt.greaterThan(remaining)) {
-      throw new BadRequestException(`Payment exceeds remaining payable (${remaining.toString()})`);
-    }
 
     const updated = await this.prisma.$transaction(async (tx) => {
+      const bill = await lockVendorBill(tx, { tenantId, billId: id });
+      if (!bill) throw new NotFoundException('Vendor bill not found');
+
+      if (bill.status === VendorBillStatus.VOID || bill.status === VendorBillStatus.PAID) {
+        throw new BadRequestException('This bill cannot accept payments');
+      }
+
+      const remaining = new Prisma.Decimal(bill.totalAmount).sub(bill.paidAmount);
+      if (payAmt.greaterThan(remaining)) {
+        throw new BadRequestException(
+          `Payment exceeds remaining payable (${remaining.toString()})`,
+        );
+      }
+
       await tx.vendorBillPayment.create({
         data: {
           tenantId,
@@ -472,6 +481,123 @@ export class VendorBillsService {
     );
   }
 
+  /**
+   * Create vendor bill for a GRN inside an existing transaction (atomic with stock receive).
+   */
+  async createBillForReceiptInTx(
+    tx: Prisma.TransactionClient,
+    args: {
+      tenantId: string;
+      actorId: string;
+      goodsReceiptId: string;
+      purchaseOrderId: string;
+      vendorId: string;
+      poNumber: string | null;
+      receiptDate: Date;
+      dueDate?: string | null;
+      lines: Array<{
+        id: string;
+        purchaseOrderLineId: string;
+        qtyReceived: Prisma.Decimal;
+        unitCost: Prisma.Decimal;
+        description: string;
+      }>;
+    },
+  ): Promise<{
+    id: string;
+    billNumber: string | null;
+    totalAmount: number;
+    remaining: number;
+  } | null> {
+    if (!args.lines.length) return null;
+
+    const existing = await tx.vendorBill.findFirst({
+      where: {
+        tenantId: args.tenantId,
+        goodsReceiptId: args.goodsReceiptId,
+        status: { not: VendorBillStatus.VOID },
+      },
+      select: { id: true, billNumber: true, totalAmount: true, paidAmount: true },
+    });
+    if (existing) {
+      const total = decimalToNumber(existing.totalAmount);
+      const paid = decimalToNumber(existing.paidAmount);
+      return {
+        id: existing.id,
+        billNumber: existing.billNumber,
+        totalAmount: total,
+        remaining: Math.max(0, total - paid),
+      };
+    }
+
+    const billLines = args.lines.map((l, idx) => {
+      const qty = decimalToNumber(l.qtyReceived);
+      const unitCost = decimalToNumber(l.unitCost);
+      const amount = roundMoney(qty * unitCost);
+      return {
+        lineNo: idx + 1,
+        description: l.description.trim(),
+        qty: new Prisma.Decimal(qty),
+        unitCost: roundMoney(unitCost),
+        amount,
+        purchaseOrderLineId: l.purchaseOrderLineId,
+        goodsReceiptLineId: l.id,
+      };
+    });
+    const totalAmount = billLines.reduce((sum, l) => sum.add(l.amount), new Prisma.Decimal(0));
+    if (totalAmount.lessThanOrEqualTo(0)) {
+      throw new BadRequestException('Bill total must be greater than 0');
+    }
+
+    const billDate = args.receiptDate.toISOString().slice(0, 10);
+    const dueRaw = args.dueDate?.trim() || billDate;
+    const billNumber = await this.nextBillNumber(tx, args.tenantId);
+
+    const created = await tx.vendorBill.create({
+      data: {
+        tenantId: args.tenantId,
+        vendorId: args.vendorId,
+        purchaseOrderId: args.purchaseOrderId,
+        goodsReceiptId: args.goodsReceiptId,
+        billNumber,
+        billDate: parseDate(billDate),
+        dueDate: parseDate(dueRaw),
+        notes: `From goods receipt · ${args.poNumber || 'PO'}`,
+        status: VendorBillStatus.UNPAID,
+        totalAmount,
+        paidAmount: new Prisma.Decimal(0),
+        createdByUserId: args.actorId,
+        lines: {
+          create: billLines.map((l) => ({
+            tenantId: args.tenantId,
+            ...l,
+          })),
+        },
+      },
+      select: { id: true, billNumber: true, totalAmount: true },
+    });
+
+    await tx.vendorLedgerEntry.create({
+      data: {
+        tenantId: args.tenantId,
+        vendorId: args.vendorId,
+        entryType: VendorLedgerEntryType.BILL,
+        amount: totalAmount,
+        referenceType: 'VendorBill',
+        referenceId: created.id,
+        notes: `Bill ${billNumber}`,
+      },
+    });
+
+    const total = decimalToNumber(created.totalAmount);
+    return {
+      id: created.id,
+      billNumber: created.billNumber,
+      totalAmount: total,
+      remaining: total,
+    };
+  }
+
   /** Billed / paid / open totals for a vendor (non-void bills). */
   async payablesSummary(tenantId: string, vendorId: string) {
     if (!(await isVendorBillsEnabled(this.prisma, tenantId))) {
@@ -629,6 +755,7 @@ export class VendorBillsService {
       status: VendorBillStatus;
       overdue: boolean;
       noDueDate: boolean;
+      daysOverdue: number | null;
     };
 
     const byVendor = new Map<
@@ -642,6 +769,8 @@ export class VendorBillsService {
       }
     >();
 
+    const asOfStart = parseDate(dateStr);
+
     for (const b of bills) {
       const total = decimalToNumber(b.totalAmount);
       const paid = decimalToNumber(b.paidAmount);
@@ -649,7 +778,14 @@ export class VendorBillsService {
       if (remaining <= 0) continue;
 
       const noDueDate = !b.dueDate;
-      const overdue = !!b.dueDate && b.dueDate < parseDate(dateStr);
+      const overdue = !!b.dueDate && b.dueDate < asOfStart;
+      let daysOverdue: number | null = null;
+      if (overdue && b.dueDate) {
+        daysOverdue = Math.max(
+          0,
+          Math.floor((asOfStart.getTime() - b.dueDate.getTime()) / (24 * 60 * 60 * 1000)),
+        );
+      }
       const row: BillRow = {
         id: b.id,
         billNumber: b.billNumber,
@@ -661,6 +797,7 @@ export class VendorBillsService {
         status: b.status,
         overdue,
         noDueDate,
+        daysOverdue,
       };
 
       const existing = byVendor.get(b.vendorId);
@@ -686,6 +823,122 @@ export class VendorBillsService {
       totalDue,
       vendorCount: vendors.length,
       vendors,
+    };
+  }
+
+  /**
+   * Open bills with due dates — payment schedule (overdue + upcoming).
+   * Sorted by due date ascending.
+   */
+  async listSchedule(tenantId: string, query: { daysAhead?: number }) {
+    await assertVendorBillsEnabled(this.prisma, tenantId);
+
+    const tz = await getTenantTimezone(this.prisma, tenantId);
+    const todayStr = todayYmdInTimeZone(tz);
+    const todayStart = parseDate(todayStr);
+    const daysAhead = Math.min(90, Math.max(1, query.daysAhead ?? 30));
+    const horizon = new Date(todayStart);
+    horizon.setUTCDate(horizon.getUTCDate() + daysAhead);
+
+    const bills = await this.prisma.vendorBill.findMany({
+      where: {
+        tenantId,
+        status: { in: [VendorBillStatus.UNPAID, VendorBillStatus.PARTIALLY_PAID] },
+        dueDate: { not: null, lte: endOfDay(horizon.toISOString().slice(0, 10)) },
+      },
+      include: {
+        vendor: { select: { id: true, name: true, phone: true } },
+      },
+      orderBy: [{ dueDate: 'asc' }, { billDate: 'asc' }],
+    });
+
+    const items = bills
+      .map((b) => {
+        const total = decimalToNumber(b.totalAmount);
+        const paid = decimalToNumber(b.paidAmount);
+        const remaining = Math.max(0, total - paid);
+        if (remaining <= 0 || !b.dueDate) return null;
+
+        const overdue = b.dueDate < todayStart;
+        const dueToday = !overdue && b.dueDate.toISOString().slice(0, 10) === todayStr;
+        let daysOverdue: number | null = null;
+        let daysUntilDue: number | null = null;
+        if (overdue) {
+          daysOverdue = Math.max(
+            0,
+            Math.floor((todayStart.getTime() - b.dueDate.getTime()) / (24 * 60 * 60 * 1000)),
+          );
+        } else {
+          daysUntilDue = Math.max(
+            0,
+            Math.floor((b.dueDate.getTime() - todayStart.getTime()) / (24 * 60 * 60 * 1000)),
+          );
+        }
+
+        return {
+          id: b.id,
+          billNumber: b.billNumber,
+          billDate: b.billDate,
+          dueDate: b.dueDate,
+          remaining: round2(remaining),
+          status: b.status,
+          overdue,
+          dueToday,
+          daysOverdue,
+          daysUntilDue,
+          vendor: b.vendor,
+        };
+      })
+      .filter((x): x is NonNullable<typeof x> => x != null);
+
+    return {
+      date: todayStr,
+      daysAhead,
+      totalRemaining: round2(items.reduce((s, i) => s + i.remaining, 0)),
+      overdueCount: items.filter((i) => i.overdue).length,
+      items,
+    };
+  }
+
+  /** In-app WARNING for the current user summarizing overdue payables. */
+  async notifyOverduePayables(tenantId: string, userId: string) {
+    await assertVendorBillsEnabled(this.prisma, tenantId);
+
+    const dues = await this.listDues(tenantId, {});
+    let overdueVendors = 0;
+    let overdueAmount = 0;
+    for (const v of dues.vendors) {
+      const overdueBills = v.bills.filter((b) => b.overdue);
+      if (overdueBills.length === 0) continue;
+      overdueVendors += 1;
+      overdueAmount = round2(overdueAmount + overdueBills.reduce((s, b) => s + b.remaining, 0));
+    }
+
+    if (overdueVendors === 0) {
+      return {
+        notified: false,
+        overdueVendors: 0,
+        overdueAmount: 0,
+        message: 'No overdue payables',
+      };
+    }
+
+    await this.notifications.create(
+      {
+        userId,
+        title: 'Overdue vendor payables',
+        body: `${overdueVendors} vendor(s) have overdue bills totaling ${overdueAmount.toFixed(2)}. Open Payables Due to pay or remind.`,
+        type: NotificationType.WARNING,
+        link: '/vendor-bills/dues',
+      },
+      tenantId,
+    );
+
+    return {
+      notified: true,
+      overdueVendors,
+      overdueAmount,
+      message: 'Notification created',
     };
   }
 

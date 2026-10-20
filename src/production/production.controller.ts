@@ -1,4 +1,14 @@
-import { Body, Controller, Get, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Headers,
+  Param,
+  Patch,
+  Post,
+  Query,
+  UseGuards,
+} from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { TenantGuard } from '../common/guards/tenant.guard';
 import { PermissionsGuard } from '../common/guards/permissions.guard';
@@ -6,6 +16,8 @@ import { RequirePermissions } from '../common/decorators/permissions.decorator';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { CurrentTenant } from '../common/decorators/current-tenant.decorator';
 import { AuthenticatedUser } from '../auth/types/jwt-payload.type';
+import { PrismaService } from '../prisma/prisma.service';
+import { runIdempotent } from '../common/helpers/idempotency.helper';
 import { ProductionService } from './production.service';
 import {
   CancelProductionOrderDto,
@@ -18,12 +30,21 @@ import {
 @UseGuards(JwtAuthGuard, TenantGuard, PermissionsGuard)
 @Controller({ path: 'production-orders', version: '1' })
 export class ProductionController {
-  constructor(private readonly productionService: ProductionService) {}
+  constructor(
+    private readonly productionService: ProductionService,
+    private readonly prisma: PrismaService,
+  ) {}
 
   @Get()
   @RequirePermissions('production:read')
   list(@Query() query: ListProductionOrdersQueryDto, @CurrentTenant() tenantId: string) {
     return this.productionService.list(tenantId, query);
+  }
+
+  @Get(':id/shortage-preview')
+  @RequirePermissions('production:read')
+  shortagePreview(@Param('id') id: string, @CurrentTenant() tenantId: string) {
+    return this.productionService.shortagePreview(id, tenantId);
   }
 
   @Get(':id')
@@ -80,8 +101,13 @@ export class ProductionController {
     @Body() dto: CompleteProductionOrderDto,
     @CurrentTenant() tenantId: string,
     @CurrentUser() user: AuthenticatedUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.productionService.complete(id, tenantId, dto, user.id);
+    return runIdempotent(
+      this.prisma,
+      { tenantId, scope: 'production:complete', key: idempotencyKey },
+      () => this.productionService.complete(id, tenantId, dto, user.id),
+    );
   }
 
   @Post(':id/cancel')

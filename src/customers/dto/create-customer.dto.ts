@@ -32,9 +32,9 @@ export class CustomerProductPriceInputDto {
 }
 
 export class OpeningContainerInputDto {
-  @ApiProperty()
+  @ApiProperty({ description: 'Shared packaging type (e.g. 20L Can)' })
   @IsString()
-  productId!: string;
+  packagingTypeId!: string;
 
   @ApiProperty({ example: 2 })
   @Type(() => Number)
@@ -161,7 +161,7 @@ export class CreateCustomerDto {
 
   @ApiPropertyOptional({
     type: [OpeningContainerInputDto],
-    description: 'Day-0 cans already with customer (returnable products only)',
+    description: 'Day-0 cans already with customer (by packaging type)',
   })
   @IsOptional()
   @IsArray()

@@ -3,10 +3,10 @@ import { IsInt, IsOptional, IsString, MaxLength, MinLength, ValidateIf } from 'c
 import { Type } from 'class-transformer';
 
 export class AdjustCustomerContainersDto {
-  @ApiProperty()
+  @ApiProperty({ description: 'Shared packaging type (e.g. 20L Can)' })
   @IsString()
   @MinLength(1)
-  productId!: string;
+  packagingTypeId!: string;
 
   @ApiProperty({ example: 1, description: 'Signed delta; non-zero' })
   @Type(() => Number)

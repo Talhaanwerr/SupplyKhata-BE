@@ -14,6 +14,10 @@ import { assertProductionEnabled } from '../common/helpers/production.helper';
 import { assertInventoryEnabled } from '../common/helpers/inventory.helper';
 import { assertRawMaterialsEnabled } from '../common/helpers/raw-materials.helper';
 import {
+  applyProductStockMovement,
+  applyRawStockMovement,
+} from '../common/helpers/stock-apply.helper';
+import {
   CancelProductionOrderDto,
   CompleteProductionOrderDto,
   CreateProductionOrderDto,
@@ -29,7 +33,7 @@ function decimalToNumber(value: DecimalLike): number | null {
 }
 
 function parseDate(value: string): Date {
-  const parsed = new Date(value);
+  const parsed = parseCalendarDateUtc(value, false);
   if (Number.isNaN(parsed.getTime())) {
     throw new BadRequestException('Invalid date');
   }
@@ -214,6 +218,61 @@ export class ProductionService {
     });
 
     return this.mapOrder(order);
+  }
+
+  /**
+   * BOM × plannedQty vs raw on-hand at the order location — check before Start.
+   */
+  async shortagePreview(id: string, tenantId: string) {
+    await assertProductionEnabled(this.prisma, tenantId);
+    const order = await this.requireOrder(tenantId, id);
+    const bomLines = order.bom?.lines ?? [];
+    const plannedQty = decimalToNumber(order.plannedQty) ?? 0;
+
+    const rawIds = bomLines.map((l) => l.rawMaterialId);
+    const balances =
+      rawIds.length === 0
+        ? []
+        : await this.prisma.rawMaterialBalance.findMany({
+            where: {
+              tenantId,
+              locationId: order.locationId,
+              rawMaterialId: { in: rawIds },
+            },
+            select: { rawMaterialId: true, quantity: true },
+          });
+    const onHandByRaw = new Map(
+      balances.map((b) => [b.rawMaterialId, decimalToNumber(b.quantity)]),
+    );
+
+    const lines = bomLines.map((l) => {
+      const qtyPer = decimalToNumber(l.qtyPerOutputUnit) ?? 0;
+      const needed = Math.round(qtyPer * plannedQty * 1000) / 1000;
+      const onHand = onHandByRaw.get(l.rawMaterialId) ?? 0;
+      const shortage = Math.max(0, Math.round((needed - onHand) * 1000) / 1000);
+      return {
+        rawMaterialId: l.rawMaterialId,
+        rawMaterial: l.rawMaterial,
+        qtyPerOutputUnit: qtyPer,
+        needed,
+        onHand,
+        shortage,
+        ok: shortage <= 0,
+      };
+    });
+
+    const shortCount = lines.filter((l) => !l.ok).length;
+    return {
+      productionOrderId: order.id,
+      productId: order.productId,
+      product: order.product,
+      locationId: order.locationId,
+      location: order.location,
+      plannedQty,
+      canMake: shortCount === 0,
+      shortCount,
+      lines,
+    };
   }
 
   async start(id: string, tenantId: string, actorId: string) {
@@ -512,51 +571,15 @@ export class ProductionService {
       referenceId: string;
     },
   ) {
-    const balance = await tx.rawMaterialBalance.findUnique({
-      where: {
-        tenantId_locationId_rawMaterialId: {
-          tenantId: args.tenantId,
-          locationId: args.locationId,
-          rawMaterialId: args.rawMaterialId,
-        },
-      },
-    });
-    const current = balance ? new Prisma.Decimal(balance.quantity) : new Prisma.Decimal(0);
-    const next = current.add(args.quantity);
-    if (next.lessThan(0)) {
-      throw new BadRequestException(
-        'Insufficient raw material stock: resulting quantity would be negative',
-      );
-    }
-
-    if (balance) {
-      await tx.rawMaterialBalance.update({
-        where: { id: balance.id },
-        data: { quantity: next },
-      });
-    } else {
-      // Creating with negative would fail next.lessThan check already
-      await tx.rawMaterialBalance.create({
-        data: {
-          tenantId: args.tenantId,
-          locationId: args.locationId,
-          rawMaterialId: args.rawMaterialId,
-          quantity: next,
-        },
-      });
-    }
-
-    await tx.rawMaterialMovement.create({
-      data: {
-        tenantId: args.tenantId,
-        locationId: args.locationId,
-        rawMaterialId: args.rawMaterialId,
-        type: RawMaterialMovementType.PRODUCTION_CONSUME,
-        quantity: args.quantity,
-        referenceType: 'ProductionOrder',
-        referenceId: args.referenceId,
-        createdByUserId: args.actorId,
-      },
+    await applyRawStockMovement(tx, {
+      tenantId: args.tenantId,
+      locationId: args.locationId,
+      rawMaterialId: args.rawMaterialId,
+      type: RawMaterialMovementType.PRODUCTION_CONSUME,
+      quantity: args.quantity,
+      referenceType: 'ProductionOrder',
+      referenceId: args.referenceId,
+      actorId: args.actorId,
     });
   }
 
@@ -571,45 +594,15 @@ export class ProductionService {
       referenceId: string;
     },
   ) {
-    const balance = await tx.stockBalance.findUnique({
-      where: {
-        tenantId_locationId_productId: {
-          tenantId: args.tenantId,
-          locationId: args.locationId,
-          productId: args.productId,
-        },
-      },
-    });
-    const current = balance ? new Prisma.Decimal(balance.quantity) : new Prisma.Decimal(0);
-    const next = current.add(args.quantity);
-
-    if (balance) {
-      await tx.stockBalance.update({
-        where: { id: balance.id },
-        data: { quantity: next },
-      });
-    } else {
-      await tx.stockBalance.create({
-        data: {
-          tenantId: args.tenantId,
-          locationId: args.locationId,
-          productId: args.productId,
-          quantity: next,
-        },
-      });
-    }
-
-    await tx.stockMovement.create({
-      data: {
-        tenantId: args.tenantId,
-        locationId: args.locationId,
-        productId: args.productId,
-        type: StockMovementType.PRODUCTION_IN,
-        quantity: args.quantity,
-        referenceType: 'ProductionOrder',
-        referenceId: args.referenceId,
-        createdByUserId: args.actorId,
-      },
+    await applyProductStockMovement(tx, {
+      tenantId: args.tenantId,
+      locationId: args.locationId,
+      productId: args.productId,
+      type: StockMovementType.PRODUCTION_IN,
+      quantity: args.quantity,
+      referenceType: 'ProductionOrder',
+      referenceId: args.referenceId,
+      actorId: args.actorId,
     });
   }
 

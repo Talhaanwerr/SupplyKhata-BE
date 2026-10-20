@@ -228,13 +228,15 @@ model Tenant {
   auditLogs             AuditLog[]
   areas                 Area[]
   products              Product[]
+  packagingTypes        PackagingType[]
   customers             Customer[]
   vehicles              Vehicle[]
   deliveryRuns          DeliveryRun[]
   deliveries            Delivery[]
-  deliveryRunStocks     DeliveryRunStock[]
-  deliveryItems         DeliveryItem[]
-  containerMovements    ContainerMovement[]
+  deliveryRunStocks            DeliveryRunStock[]
+  deliveryRunPackagingStocks   DeliveryRunPackagingStock[]
+  deliveryItems                DeliveryItem[]
+  containerMovements           ContainerMovement[]
   customerLedgerEntries CustomerLedgerEntry[]
   payments              Payment[]
   refillBatches         RefillBatch[]
@@ -271,10 +273,30 @@ model Tenant {
   bomLines              BomLine[]
   productionOrders      ProductionOrder[]
   productionConsumeLines ProductionConsumeLine[]
+  idempotencyKeys       IdempotencyKey[]
 
   @@index([status])
   @@index([createdAt])
   @@map("tenants")
+}
+
+// ─── Idempotency (double-submit / retry safe writes) ──────────
+
+model IdempotencyKey {
+  id           String   @id @default(cuid())
+  tenantId     String
+  /// e.g. deliveries:create, payments:create, handovers:create, grn:receive, vendor-bills:pay, production:complete
+  scope        String
+  key          String
+  /// Null while in progress; JSON payload of successful response when done.
+  responseJson Json?
+  createdAt    DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, scope, key])
+  @@index([tenantId, createdAt])
+  @@map("idempotency_keys")
 }
 
 // ─── User ─────────────────────────────────────────────────────
@@ -557,6 +579,30 @@ model Area {
   @@map("areas")
 }
 
+// ─── Packaging type (shared returnable can / crate pool) ───────
+
+model PackagingType {
+  id        String    @id @default(cuid())
+  tenantId  String
+  name      String
+  /// e.g. 20 for a 20L can — packaging size only, not sale qty.
+  capacity  Decimal?  @db.Decimal(10, 2)
+  notes     String?
+  isActive  Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  tenant             Tenant              @relation(fields: [tenantId], references: [id])
+  products           Product[]
+  containerMovements ContainerMovement[]
+  deliveryRunPackagingStocks DeliveryRunPackagingStock[]
+
+  @@index([tenantId])
+  @@index([tenantId, isActive])
+  @@map("packaging_types")
+}
+
 // ─── Product (flat — each water size is its own product) ───────
 
 model Product {
@@ -577,7 +623,10 @@ model Product {
   unitsPerPack        Int?
   packLabel           String?
   /// Packaging size only (e.g. 20 for a 20L returnable can) — NOT sale qty.
+  /// Prefer PackagingType.capacity when packagingTypeId is set.
   containerCapacity   Decimal?        @db.Decimal(10, 2)
+  /// Shared can/crate pool for returnable products (required in app when returnable + flag ON).
+  packagingTypeId     String?
   /// When false, quantityDelivered / filledCount must be whole numbers.
   allowFractionalQty  Boolean         @default(false)
   /// Optional low-stock threshold (base units). Used when inventory flag is ON.
@@ -587,6 +636,7 @@ model Product {
   deletedAt           DateTime?
 
   tenant             Tenant                 @relation(fields: [tenantId], references: [id])
+  packagingType      PackagingType?         @relation(fields: [packagingTypeId], references: [id])
   costHistory        ProductCostHistory[]
   customerPrices     CustomerProductPrice[]
   deliveryRunStocks  DeliveryRunStock[]
@@ -605,6 +655,7 @@ model Product {
 
   @@index([tenantId])
   @@index([tenantId, isActive])
+  @@index([tenantId, packagingTypeId])
   @@map("products")
 }
 
@@ -739,12 +790,13 @@ model DeliveryRun {
   rider        User               @relation(fields: [riderId], references: [id])
   vehicle      Vehicle            @relation(fields: [vehicleId], references: [id])
   loadLocation StockLocation?     @relation("DeliveryRunLoadLocation", fields: [loadLocationId], references: [id], onDelete: SetNull)
-  stocks       DeliveryRunStock[]
-  deliveries   Delivery[]
-  refillLoads  DeliveryRunRefillLoad[]
-  expenses     Expense[]
-  cashHandovers CashHandover[]
-  plannedStops PlannedDeliveryStop[]
+  stocks            DeliveryRunStock[]
+  packagingStocks   DeliveryRunPackagingStock[]
+  deliveries        Delivery[]
+  refillLoads       DeliveryRunRefillLoad[]
+  expenses          Expense[]
+  cashHandovers     CashHandover[]
+  plannedStops      PlannedDeliveryStop[]
 
   @@index([tenantId])
   @@index([tenantId, riderId])
@@ -762,9 +814,9 @@ model DeliveryRunStock {
   stockType     StockType
   /// Units loaded in product baseUnit (cans / litres / kg).
   filledCount   Decimal   @default(0) @db.Decimal(12, 3)
-  /// Whole filled packaging units on vehicle (cans). For PCS equals filledCount; for LTR/KG set explicitly (e.g. 40L in 3 cans → 3).
+  /// Legacy per-product cans. Prefer DeliveryRunPackagingStock when present (shared oil can pool).
   filledPackagingCount Int @default(0)
-  /// Whole packaging empties on vehicle (always integer packaging units).
+  /// Legacy per-product empties. Prefer DeliveryRunPackagingStock when present.
   emptyCount    Int       @default(0)
 
   tenant      Tenant      @relation(fields: [tenantId], references: [id])
@@ -775,6 +827,26 @@ model DeliveryRunStock {
   @@index([tenantId])
   @@index([productId])
   @@map("delivery_run_stocks")
+}
+
+/// Truck cans/empties by packaging type (shared pool for multiple oil grades).
+model DeliveryRunPackagingStock {
+  id              String    @id @default(cuid())
+  tenantId        String
+  deliveryRunId   String
+  packagingTypeId String
+  stockType       StockType
+  filledCount     Int       @default(0)
+  emptyCount      Int       @default(0)
+
+  tenant        Tenant        @relation(fields: [tenantId], references: [id])
+  deliveryRun   DeliveryRun   @relation(fields: [deliveryRunId], references: [id])
+  packagingType PackagingType @relation(fields: [packagingTypeId], references: [id])
+
+  @@unique([deliveryRunId, packagingTypeId, stockType], map: "drps_run_type_stock_key")
+  @@index([tenantId])
+  @@index([packagingTypeId])
+  @@map("delivery_run_packaging_stocks")
 }
 
 model Delivery {
@@ -835,24 +907,30 @@ model DeliveryItem {
 }
 
 model ContainerMovement {
-  id             String                @id @default(cuid())
-  tenantId       String
-  productId      String
-  deliveryItemId String?
-  customerId     String?
-  vehicleId      String?
-  movementType   ContainerMovementType
-  quantity       Int
-  notes          String?
-  createdAt      DateTime              @default(now())
+  id              String                @id @default(cuid())
+  tenantId        String
+  /// Set on delivery/order lines for audit (which grade sold). Null OK for plant opening/adjust by type.
+  productId       String?
+  /// Required for all new writes (shared can pool). Nullable in DB only if legacy rows exist.
+  packagingTypeId String?
+  deliveryItemId  String?
+  customerId      String?
+  vehicleId       String?
+  movementType    ContainerMovementType
+  quantity        Int
+  notes           String?
+  createdAt       DateTime              @default(now())
 
-  tenant       Tenant        @relation(fields: [tenantId], references: [id])
-  product      Product       @relation(fields: [productId], references: [id])
-  deliveryItem DeliveryItem? @relation(fields: [deliveryItemId], references: [id])
-  customer     Customer?     @relation(fields: [customerId], references: [id])
-  vehicle      Vehicle?      @relation(fields: [vehicleId], references: [id])
+  tenant        Tenant         @relation(fields: [tenantId], references: [id])
+  product       Product?       @relation(fields: [productId], references: [id])
+  packagingType PackagingType? @relation(fields: [packagingTypeId], references: [id])
+  deliveryItem  DeliveryItem?  @relation(fields: [deliveryItemId], references: [id])
+  customer      Customer?      @relation(fields: [customerId], references: [id])
+  vehicle       Vehicle?       @relation(fields: [vehicleId], references: [id])
 
   @@index([tenantId, productId])
+  @@index([tenantId, packagingTypeId])
+  @@index([tenantId, customerId, packagingTypeId])
   @@index([tenantId, customerId, productId])
   @@index([tenantId, movementType])
   @@map("container_movements")

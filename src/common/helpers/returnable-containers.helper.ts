@@ -15,7 +15,27 @@ export type PackagingProduct = {
   isReturnable: boolean;
   name?: string;
   containerCapacity?: Prisma.Decimal | number | null;
+  packagingTypeId?: string | null;
 };
+
+/**
+ * Returnable products must link to a PackagingType when containers are tracked.
+ * Returns packagingTypeId or throws BadRequest.
+ */
+export function assertProductPackaging(product: {
+  isReturnable: boolean;
+  packagingTypeId?: string | null;
+  name?: string;
+}): string {
+  if (!product.isReturnable) {
+    throw new BadRequestException(`Product "${product.name ?? 'product'}" is not returnable`);
+  }
+  const packagingTypeId = product.packagingTypeId?.trim();
+  if (!packagingTypeId) {
+    throw new BadRequestException('Returnable product must have a packaging type');
+  }
+  return packagingTypeId;
+}
 
 /**
  * True when sale qty is litres/kg but packaging (cans) is tracked separately.

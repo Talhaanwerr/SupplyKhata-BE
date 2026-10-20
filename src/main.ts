@@ -63,7 +63,13 @@ async function bootstrap(): Promise<void> {
       }
     },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Tenant-ID', 'X-Request-ID'],
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+      'X-Tenant-ID',
+      'X-Request-ID',
+      'Idempotency-Key',
+    ],
     credentials: true,
   });
 

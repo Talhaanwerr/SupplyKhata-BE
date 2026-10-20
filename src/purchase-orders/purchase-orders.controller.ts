@@ -1,4 +1,14 @@
-import { Body, Controller, Get, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Headers,
+  Param,
+  Patch,
+  Post,
+  Query,
+  UseGuards,
+} from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { TenantGuard } from '../common/guards/tenant.guard';
 import { PermissionsGuard } from '../common/guards/permissions.guard';
@@ -6,6 +16,8 @@ import { RequirePermissions } from '../common/decorators/permissions.decorator';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { CurrentTenant } from '../common/decorators/current-tenant.decorator';
 import { AuthenticatedUser } from '../auth/types/jwt-payload.type';
+import { PrismaService } from '../prisma/prisma.service';
+import { runIdempotent } from '../common/helpers/idempotency.helper';
 import { PurchaseOrdersService } from './purchase-orders.service';
 import { GoodsReceiptsService } from './goods-receipts.service';
 import {
@@ -22,12 +34,23 @@ export class PurchaseOrdersController {
   constructor(
     private readonly purchaseOrdersService: PurchaseOrdersService,
     private readonly goodsReceiptsService: GoodsReceiptsService,
+    private readonly prisma: PrismaService,
   ) {}
 
   @Get()
   @RequirePermissions('purchase-orders:read')
   list(@Query() query: ListPurchaseOrdersQueryDto, @CurrentTenant() tenantId: string) {
     return this.purchaseOrdersService.list(tenantId, query);
+  }
+
+  @Get('audit/grn-bills')
+  @RequirePermissions('purchase-orders:read')
+  grnBillAudit(
+    @Query('mismatchesOnly') mismatchesOnly: string | undefined,
+    @CurrentTenant() tenantId: string,
+  ) {
+    const only = mismatchesOnly === 'true' || mismatchesOnly === '1' || mismatchesOnly === 'yes';
+    return this.purchaseOrdersService.grnBillAudit(tenantId, { mismatchesOnly: only });
   }
 
   @Post()
@@ -68,8 +91,11 @@ export class PurchaseOrdersController {
     @Body() dto: CreateGoodsReceiptDto,
     @CurrentTenant() tenantId: string,
     @CurrentUser() user: AuthenticatedUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.goodsReceiptsService.createForPo(id, tenantId, dto, user.id);
+    return runIdempotent(this.prisma, { tenantId, scope: 'grn:create', key: idempotencyKey }, () =>
+      this.goodsReceiptsService.createForPo(id, tenantId, dto, user.id),
+    );
   }
 
   @Get(':id/receipts')

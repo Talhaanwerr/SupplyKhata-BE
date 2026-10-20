@@ -13,6 +13,7 @@ import {
   assertNoPackFieldsWhenDisabled,
   isPackHelpersEnabled,
 } from '../common/helpers/pack-helpers.helper';
+import { isReturnableContainersEnabled } from '../common/helpers/returnable-containers.helper';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { ListProductsQueryDto } from './dto/list-products-query.dto';
@@ -69,6 +70,8 @@ export type ProductItem = {
   unitsPerPack: number | null;
   packLabel: string | null;
   containerCapacity: number | null;
+  packagingTypeId: string | null;
+  packagingTypeName: string | null;
   allowFractionalQty: boolean;
   hasPackHelper: boolean;
   /** Low-stock threshold in base units (inventory module). */
@@ -76,6 +79,9 @@ export type ProductItem = {
   createdAt: Date;
   updatedAt: Date;
   currentCost: number | null;
+  /** Sum of StockBalance across all locations (base units). */
+  onHandQty: number;
+  isLowStock: boolean;
 };
 
 @Injectable()
@@ -104,25 +110,27 @@ export class ProductsService {
     const products = await this.prisma.product.findMany({
       where,
       orderBy: { name: 'asc' },
+      include: { packagingType: { select: { name: true } } },
     });
 
+    const ids = products.map((p) => p.id);
     const tz = await getTenantTimezone(this.prisma, tenantId);
-    const costMap = await this.resolveCurrentCosts(
-      tenantId,
-      products.map((p) => p.id),
-      endOfTodayInTimeZoneUtc(tz),
-    );
+    const [costMap, onHandMap] = await Promise.all([
+      this.resolveCurrentCosts(tenantId, ids, endOfTodayInTimeZoneUtc(tz)),
+      this.sumOnHandByProductIds(tenantId, ids),
+    ]);
 
-    return products.map((p) => this.toItem(p, costMap.get(p.id) ?? null));
+    return products.map((p) => this.toItem(p, costMap.get(p.id) ?? null, onHandMap.get(p.id) ?? 0));
   }
 
   async findOne(id: string, tenantId: string): Promise<ProductItem> {
     const tz = await getTenantTimezone(this.prisma, tenantId);
-    const [product, currentCost] = await Promise.all([
+    const [product, currentCost, onHandMap] = await Promise.all([
       this.findActiveOrThrow(id, tenantId),
       this.resolveCurrentCost(tenantId, id, endOfTodayInTimeZoneUtc(tz)),
+      this.sumOnHandByProductIds(tenantId, [id]),
     ]);
-    return this.toItem(product, currentCost);
+    return this.toItem(product, currentCost, onHandMap.get(id) ?? 0);
   }
 
   async create(tenantId: string, dto: CreateProductDto, actorId: string): Promise<ProductItem> {
@@ -149,6 +157,13 @@ export class ProductsService {
       ? false
       : (dto.allowFractionalQty ?? dto.baseUnit === ProductBaseUnit.LTR);
     const volume = isKg ? null : (dto.volume ?? null);
+    const isReturnable = dto.isReturnable ?? true;
+    const packagingTypeId = await this.resolvePackagingTypeId(
+      tenantId,
+      isReturnable,
+      dto.packagingTypeId,
+      dto.containerCapacity,
+    );
 
     const product = await this.prisma.product.create({
       data: {
@@ -162,12 +177,14 @@ export class ProductsService {
         unitsPerPack: pack.unitsPerPack,
         packLabel: pack.packLabel,
         containerCapacity: dto.containerCapacity ?? null,
+        packagingTypeId,
         allowFractionalQty,
-        isReturnable: dto.isReturnable ?? true,
+        isReturnable,
         containerType: dto.containerType?.trim() || null,
         isActive: dto.isActive ?? true,
         reorderLevel: dto.reorderLevel ?? null,
       },
+      include: { packagingType: { select: { name: true } } },
     });
 
     let currentCost: number | null = null;
@@ -213,7 +230,7 @@ export class ProductsService {
       });
     }
 
-    return this.toItem(product, currentCost);
+    return this.toItem(product, currentCost, 0);
   }
 
   async update(
@@ -266,6 +283,20 @@ export class ProductsService {
         ? { volume: dto.volume }
         : {};
 
+    const nextReturnable =
+      dto.isReturnable !== undefined ? dto.isReturnable : existing.isReturnable;
+    const nextPackagingTypeId =
+      dto.packagingTypeId !== undefined ? dto.packagingTypeId : existing.packagingTypeId;
+    const packagingTypeId = await this.resolvePackagingTypeId(
+      tenantId,
+      nextReturnable,
+      nextPackagingTypeId,
+      dto.containerCapacity !== undefined
+        ? dto.containerCapacity
+        : decimalToNumber(existing.containerCapacity),
+    );
+    const packagingTypePatch = { packagingTypeId };
+
     const updated = await this.prisma.product.update({
       where: { id },
       data: {
@@ -285,6 +316,7 @@ export class ProductsService {
         ...(dto.containerCapacity !== undefined
           ? { containerCapacity: dto.containerCapacity }
           : {}),
+        ...packagingTypePatch,
         ...(allowFractionalQty !== undefined ? { allowFractionalQty } : {}),
         ...(dto.isReturnable !== undefined ? { isReturnable: dto.isReturnable } : {}),
         ...(dto.containerType !== undefined
@@ -293,9 +325,10 @@ export class ProductsService {
         ...(dto.isActive !== undefined ? { isActive: dto.isActive } : {}),
         ...(dto.reorderLevel !== undefined ? { reorderLevel: dto.reorderLevel } : {}),
       },
+      include: { packagingType: { select: { name: true } } },
     });
 
-    const [, currentCost] = await Promise.all([
+    const [, currentCost, onHandMap] = await Promise.all([
       this.audit.write({
         tenantId,
         actorId,
@@ -315,9 +348,10 @@ export class ProductsService {
         id,
         endOfTodayInTimeZoneUtc(await getTenantTimezone(this.prisma, tenantId)),
       ),
+      this.sumOnHandByProductIds(tenantId, [id]),
     ]);
 
-    return this.toItem(updated, currentCost);
+    return this.toItem(updated, currentCost, onHandMap.get(id) ?? 0);
   }
 
   async softDelete(id: string, tenantId: string, actorId: string): Promise<void> {
@@ -424,6 +458,7 @@ export class ProductsService {
   private async findActiveOrThrow(id: string, tenantId: string) {
     const product = await this.prisma.product.findFirst({
       where: { id, tenantId, deletedAt: null },
+      include: { packagingType: { select: { name: true } } },
     });
     if (!product) throw new NotFoundException('Product not found');
     return product;
@@ -491,6 +526,52 @@ export class ProductsService {
     return map;
   }
 
+  private async sumOnHandByProductIds(
+    tenantId: string,
+    productIds: string[],
+  ): Promise<Map<string, number>> {
+    const map = new Map<string, number>();
+    if (productIds.length === 0) return map;
+
+    const grouped = await this.prisma.stockBalance.groupBy({
+      by: ['productId'],
+      where: { tenantId, productId: { in: productIds } },
+      _sum: { quantity: true },
+    });
+    for (const g of grouped) {
+      map.set(g.productId, decimalToNumber(g._sum.quantity) ?? 0);
+    }
+    return map;
+  }
+
+  /**
+   * When containers flag ON and product is returnable, packagingTypeId is required.
+   * Optionally mirror PackagingType.capacity onto containerCapacity when capacity missing.
+   */
+  private async resolvePackagingTypeId(
+    tenantId: string,
+    isReturnable: boolean,
+    packagingTypeId: string | null | undefined,
+    _containerCapacity: number | null | undefined,
+  ): Promise<string | null> {
+    const containersOn = await isReturnableContainersEnabled(this.prisma, tenantId);
+    if (!isReturnable || !containersOn) {
+      return packagingTypeId?.trim() || null;
+    }
+    const id = packagingTypeId?.trim();
+    if (!id) {
+      throw new BadRequestException('Returnable product must have a packaging type');
+    }
+    const type = await this.prisma.packagingType.findFirst({
+      where: { id, tenantId, deletedAt: null, isActive: true },
+      select: { id: true },
+    });
+    if (!type) {
+      throw new BadRequestException('Packaging type must be active in this workspace');
+    }
+    return type.id;
+  }
+
   private toItem(
     product: {
       id: string;
@@ -507,13 +588,18 @@ export class ProductsService {
       unitsPerPack: number | null;
       packLabel: string | null;
       containerCapacity: Prisma.Decimal | null;
+      packagingTypeId?: string | null;
+      packagingType?: { name: string } | null;
       allowFractionalQty: boolean;
       reorderLevel: Prisma.Decimal | null;
       createdAt: Date;
       updatedAt: Date;
     },
     currentCost: number | null,
+    onHandQty: number,
   ): ProductItem {
+    const reorderLevel =
+      product.reorderLevel == null ? null : Number(product.reorderLevel.toString());
     return {
       id: product.id,
       tenantId: product.tenantId,
@@ -529,12 +615,16 @@ export class ProductsService {
       unitsPerPack: product.unitsPerPack,
       packLabel: product.packLabel,
       containerCapacity: decimalToNumber(product.containerCapacity),
+      packagingTypeId: product.packagingTypeId ?? null,
+      packagingTypeName: product.packagingType?.name ?? null,
       allowFractionalQty: product.allowFractionalQty,
       hasPackHelper: product.unitsPerPack != null && product.unitsPerPack > 0,
-      reorderLevel: product.reorderLevel == null ? null : Number(product.reorderLevel.toString()),
+      reorderLevel,
       createdAt: product.createdAt,
       updatedAt: product.updatedAt,
       currentCost,
+      onHandQty,
+      isLowStock: reorderLevel != null && onHandQty <= reorderLevel,
     };
   }
 

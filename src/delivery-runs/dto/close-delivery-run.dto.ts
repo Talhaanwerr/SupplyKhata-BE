@@ -10,6 +10,7 @@ import {
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { DeliveryRunStockDto } from './delivery-run-stock.dto';
+import { DeliveryRunPackagingStockDto } from './delivery-run-packaging-stock.dto';
 import { ReturnToWarehouseLineDto } from './return-to-warehouse-line.dto';
 
 export class CloseDeliveryRunDto {
@@ -26,6 +27,17 @@ export class CloseDeliveryRunDto {
   @ValidateNested({ each: true })
   @Type(() => DeliveryRunStockDto)
   closingStock!: DeliveryRunStockDto[];
+
+  @ApiPropertyOptional({
+    type: [DeliveryRunPackagingStockDto],
+    description: 'Required when the run has opening packaging stock.',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(100)
+  @ValidateNested({ each: true })
+  @Type(() => DeliveryRunPackagingStockDto)
+  closingPackagingStock?: DeliveryRunPackagingStockDto[];
 
   /**
    * Optional leftover return when inventory ON.

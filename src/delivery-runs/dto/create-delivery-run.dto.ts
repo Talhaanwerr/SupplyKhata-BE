@@ -13,6 +13,7 @@ import {
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { DeliveryRunStockDto } from './delivery-run-stock.dto';
+import { DeliveryRunPackagingStockDto } from './delivery-run-packaging-stock.dto';
 import { DeliveryRunRefillLoadDto } from './delivery-run-refill-load.dto';
 
 export class CreateDeliveryRunDto {
@@ -41,6 +42,18 @@ export class CreateDeliveryRunDto {
   @ValidateNested({ each: true })
   @Type(() => DeliveryRunStockDto)
   openingStock!: DeliveryRunStockDto[];
+
+  @ApiPropertyOptional({
+    type: [DeliveryRunPackagingStockDto],
+    description:
+      'Truck cans by packaging type (shared oil can pool). When present, product filledPackagingCount/emptyCount are ignored.',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(100)
+  @ValidateNested({ each: true })
+  @Type(() => DeliveryRunPackagingStockDto)
+  openingPackagingStock?: DeliveryRunPackagingStockDto[];
 
   @ApiPropertyOptional({ type: [DeliveryRunRefillLoadDto] })
   @IsOptional()

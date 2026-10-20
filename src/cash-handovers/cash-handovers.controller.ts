@@ -7,6 +7,7 @@ import {
   Body,
   Param,
   Query,
+  Headers,
   UseGuards,
   HttpCode,
   HttpStatus,
@@ -18,6 +19,8 @@ import { RequirePermissions } from '../common/decorators/permissions.decorator';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { CurrentTenant } from '../common/decorators/current-tenant.decorator';
 import { AuthenticatedUser } from '../auth/types/jwt-payload.type';
+import { PrismaService } from '../prisma/prisma.service';
+import { runIdempotent } from '../common/helpers/idempotency.helper';
 import { CashHandoversService } from './cash-handovers.service';
 import { CreateCashHandoverDto } from './dto/create-cash-handover.dto';
 import { UpdateCashHandoverDto } from './dto/update-cash-handover.dto';
@@ -26,7 +29,10 @@ import { ListCashHandoversQueryDto } from './dto/list-cash-handovers-query.dto';
 @UseGuards(JwtAuthGuard, TenantGuard, PermissionsGuard)
 @Controller({ path: 'cash-handovers', version: '1' })
 export class CashHandoversController {
-  constructor(private readonly cashHandoversService: CashHandoversService) {}
+  constructor(
+    private readonly cashHandoversService: CashHandoversService,
+    private readonly prisma: PrismaService,
+  ) {}
 
   @Get()
   @RequirePermissions('handovers:read')
@@ -46,8 +52,13 @@ export class CashHandoversController {
     @Body() dto: CreateCashHandoverDto,
     @CurrentTenant() tenantId: string,
     @CurrentUser() user: AuthenticatedUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.cashHandoversService.create(tenantId, dto, user.id);
+    return runIdempotent(
+      this.prisma,
+      { tenantId, scope: 'cash-handovers:create', key: idempotencyKey },
+      () => this.cashHandoversService.create(tenantId, dto, user.id),
+    );
   }
 
   @Patch(':id')

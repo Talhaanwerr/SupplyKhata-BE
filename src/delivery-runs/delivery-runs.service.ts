@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import {
   DeliveryStatus as PrismaDeliveryStatus,
+  PlannedStopStatus as PrismaPlannedStopStatus,
   Prisma,
   RunStatus as PrismaRunStatus,
   StockMovementType,
@@ -18,6 +19,7 @@ import { UpdateDeliveryRunDto } from './dto/update-delivery-run.dto';
 import { ListDeliveryRunsQueryDto } from './dto/list-delivery-runs-query.dto';
 import { WarehouseAvailabilityQueryDto } from './dto/warehouse-availability-query.dto';
 import { DeliveryRunStockDto } from './dto/delivery-run-stock.dto';
+import { DeliveryRunPackagingStockDto } from './dto/delivery-run-packaging-stock.dto';
 import { DeliveryRunRefillLoadDto } from './dto/delivery-run-refill-load.dto';
 import { assertValidStockQuantity, decimalQtyToNumber } from '../common/helpers/product-qty.helper';
 import {
@@ -29,6 +31,9 @@ import {
   resolveFilledPackagingCount,
 } from '../common/helpers/returnable-containers.helper';
 import { assertInventoryEnabled, isInventoryEnabled } from '../common/helpers/inventory.helper';
+import { lockStockBalance } from '../common/helpers/stock-lock.helper';
+import { applyProductStockMovement } from '../common/helpers/stock-apply.helper';
+import { isRiderOnlyUser } from '../common/helpers/rider-scope.helper';
 import { InventoryService } from '../inventory/inventory.service';
 
 const DELIVERY_RUN_REF = 'DeliveryRun';
@@ -68,6 +73,7 @@ export class DeliveryRunsService {
 
   async create(tenantId: string, dto: CreateDeliveryRunDto, actorId: string) {
     this.assertUniqueProducts(dto.openingStock);
+    if (dto.openingPackagingStock) this.assertUniquePackagingTypes(dto.openingPackagingStock);
     const date = parseDate(dto.date);
     const refillLoads = dto.refillLoads ?? [];
     const plantFillEnabled = await isPlantFillEnabled(this.prisma, tenantId);
@@ -101,7 +107,16 @@ export class DeliveryRunsService {
           dto.openingStock,
           filledFromLoads,
         );
-        const openingStock = await this.withPackagingCounts(tx, tenantId, openingStockMerged);
+        const packagingMode = this.isPackagingStockMode(dto.openingPackagingStock);
+        const openingPackagingStock = packagingMode
+          ? await this.normalizePackagingStock(tx, tenantId, dto.openingPackagingStock ?? [])
+          : [];
+        const openingStock = await this.withPackagingCounts(
+          tx,
+          tenantId,
+          openingStockMerged,
+          packagingMode,
+        );
 
         const created = await tx.deliveryRun.create({
           data: {
@@ -122,6 +137,19 @@ export class DeliveryRunsService {
                 emptyCount: stock.emptyCount,
               })),
             },
+            ...(openingPackagingStock.length > 0
+              ? {
+                  packagingStocks: {
+                    create: openingPackagingStock.map((stock) => ({
+                      tenantId,
+                      packagingTypeId: stock.packagingTypeId,
+                      stockType: PrismaStockType.OPENING,
+                      filledCount: stock.filledCount,
+                      emptyCount: stock.emptyCount,
+                    })),
+                  },
+                }
+              : {}),
             ...(refillLoads.length > 0
               ? {
                   refillLoads: {
@@ -237,11 +265,18 @@ export class DeliveryRunsService {
   async list(
     tenantId: string,
     query: ListDeliveryRunsQueryDto,
+    actorId: string,
   ): Promise<PaginatedData<ReturnType<DeliveryRunsService['toListItem']>>> {
     const { skip, take } = getPaginationParams(query);
     const where: Prisma.DeliveryRunWhereInput = { tenantId };
 
-    if (query.riderId) where.riderId = query.riderId;
+    const riderOnly = await isRiderOnlyUser(this.prisma, tenantId, actorId);
+    // Pure riders always see only their runs (ignore client riderId to prevent bypass).
+    if (riderOnly) {
+      where.riderId = actorId;
+    } else if (query.riderId) {
+      where.riderId = query.riderId;
+    }
     if (query.status) where.status = query.status as unknown as PrismaRunStatus;
     if (query.dateFrom || query.dateTo) {
       where.date = {};
@@ -270,12 +305,13 @@ export class DeliveryRunsService {
     };
   }
 
-  async findOne(id: string, tenantId: string) {
+  async findOne(id: string, tenantId: string, actorId: string) {
     const run = await this.prisma.deliveryRun.findFirst({
       where: { id, tenantId },
       include: this.detailInclude(),
     });
     if (!run) throw new NotFoundException('Delivery run not found');
+    await this.assertRiderOwnsRun(tenantId, actorId, run.riderId);
     return this.toDetail(run);
   }
 
@@ -283,15 +319,22 @@ export class DeliveryRunsService {
     if (
       dto.openingCash == null &&
       !dto.openingStock &&
+      dto.openingPackagingStock === undefined &&
       dto.notes === undefined &&
       dto.loadLocationId === undefined
     ) {
       throw new BadRequestException('Nothing to update');
     }
     if (dto.openingStock) this.assertUniqueProducts(dto.openingStock);
+    if (dto.openingPackagingStock) this.assertUniquePackagingTypes(dto.openingPackagingStock);
+
+    await this.assertRiderCanAccessRunId(tenantId, id, actorId);
 
     const inventoryOn = await isInventoryEnabled(this.prisma, tenantId);
-    const warehouseAffecting = !!dto.openingStock || dto.loadLocationId !== undefined;
+    const warehouseAffecting =
+      !!dto.openingStock ||
+      dto.openingPackagingStock !== undefined ||
+      dto.loadLocationId !== undefined;
     const resolvedLocation =
       inventoryOn && warehouseAffecting
         ? await this.resolveLoadLocation(
@@ -334,43 +377,89 @@ export class DeliveryRunsService {
 
       let openingStockForWarehouse: Array<{ productId: string; filledCount: number }> | null = null;
 
-      if (dto.openingStock) {
-        await this.assertProducts(
-          tx,
-          tenantId,
-          dto.openingStock.map((stock) => stock.productId),
-        );
-        const openingStock = await this.withPackagingCounts(tx, tenantId, dto.openingStock);
-        await this.assertOpeningStockNotBelowDelivered(tx, tenantId, id, openingStock);
-        openingStockForWarehouse = openingStock.map((stock) => ({
-          productId: stock.productId,
-          filledCount: stock.filledCount,
-        }));
+      if (dto.openingStock || dto.openingPackagingStock !== undefined) {
+        const packagingMode =
+          dto.openingPackagingStock !== undefined
+            ? this.isPackagingStockMode(dto.openingPackagingStock)
+            : await this.runHasPackagingStock(tx, tenantId, id);
 
-        for (const stock of openingStock) {
-          await tx.deliveryRunStock.upsert({
-            where: {
-              deliveryRunId_productId_stockType: {
+        if (dto.openingStock) {
+          await this.assertProducts(
+            tx,
+            tenantId,
+            dto.openingStock.map((stock) => stock.productId),
+          );
+          const openingStock = await this.withPackagingCounts(
+            tx,
+            tenantId,
+            dto.openingStock,
+            packagingMode,
+          );
+          await this.assertOpeningStockNotBelowDelivered(
+            tx,
+            tenantId,
+            id,
+            openingStock,
+            packagingMode,
+          );
+          openingStockForWarehouse = openingStock.map((stock) => ({
+            productId: stock.productId,
+            filledCount: stock.filledCount,
+          }));
+
+          for (const stock of openingStock) {
+            await tx.deliveryRunStock.upsert({
+              where: {
+                deliveryRunId_productId_stockType: {
+                  deliveryRunId: id,
+                  productId: stock.productId,
+                  stockType: PrismaStockType.OPENING,
+                },
+              },
+              create: {
+                tenantId,
                 deliveryRunId: id,
                 productId: stock.productId,
                 stockType: PrismaStockType.OPENING,
+                filledCount: stock.filledCount,
+                filledPackagingCount: stock.filledPackagingCount,
+                emptyCount: stock.emptyCount,
               },
-            },
-            create: {
+              update: {
+                filledCount: stock.filledCount,
+                filledPackagingCount: stock.filledPackagingCount,
+                emptyCount: stock.emptyCount,
+              },
+            });
+          }
+        }
+
+        if (dto.openingPackagingStock !== undefined) {
+          const packagingRows = packagingMode
+            ? await this.normalizePackagingStock(tx, tenantId, dto.openingPackagingStock)
+            : [];
+          if (packagingMode) {
+            await this.assertOpeningPackagingNotBelowDelivered(tx, tenantId, id, packagingRows);
+          }
+          await tx.deliveryRunPackagingStock.deleteMany({
+            where: {
               tenantId,
               deliveryRunId: id,
-              productId: stock.productId,
               stockType: PrismaStockType.OPENING,
-              filledCount: stock.filledCount,
-              filledPackagingCount: stock.filledPackagingCount,
-              emptyCount: stock.emptyCount,
-            },
-            update: {
-              filledCount: stock.filledCount,
-              filledPackagingCount: stock.filledPackagingCount,
-              emptyCount: stock.emptyCount,
             },
           });
+          if (packagingRows.length > 0) {
+            await tx.deliveryRunPackagingStock.createMany({
+              data: packagingRows.map((stock) => ({
+                tenantId,
+                deliveryRunId: id,
+                packagingTypeId: stock.packagingTypeId,
+                stockType: PrismaStockType.OPENING,
+                filledCount: stock.filledCount,
+                emptyCount: stock.emptyCount,
+              })),
+            });
+          }
         }
       }
 
@@ -442,7 +531,9 @@ export class DeliveryRunsService {
   }
 
   async close(id: string, tenantId: string, dto: CloseDeliveryRunDto, actorId: string) {
+    await this.assertRiderCanAccessRunId(tenantId, id, actorId);
     this.assertUniqueProducts(dto.closingStock);
+    if (dto.closingPackagingStock) this.assertUniquePackagingTypes(dto.closingPackagingStock);
     const returnLines = (dto.returnToWarehouse ?? []).filter((line) => line.qty > 0);
     if (returnLines.length > 0) {
       this.assertUniqueReturnProducts(returnLines);
@@ -479,7 +570,21 @@ export class DeliveryRunsService {
         ]),
       ];
       await this.assertProducts(tx, tenantId, productIds);
-      const closingStock = await this.withPackagingCounts(tx, tenantId, dto.closingStock);
+      const packagingMode = await this.runHasPackagingStock(tx, tenantId, id);
+      if (packagingMode && (!dto.closingPackagingStock || dto.closingPackagingStock.length === 0)) {
+        throw new BadRequestException(
+          'Closing packaging stock is required when this run loaded cans by packaging type',
+        );
+      }
+      const closingPackagingStock = packagingMode
+        ? await this.normalizePackagingStock(tx, tenantId, dto.closingPackagingStock ?? [])
+        : [];
+      const closingStock = await this.withPackagingCounts(
+        tx,
+        tenantId,
+        dto.closingStock,
+        packagingMode,
+      );
 
       const leftovers = await this.computeLeftoverFilled(tx, tenantId, id);
       const returnByProduct = new Map(returnLines.map((line) => [line.productId, line.qty]));
@@ -541,6 +646,19 @@ export class DeliveryRunsService {
         })),
       });
 
+      if (closingPackagingStock.length > 0) {
+        await tx.deliveryRunPackagingStock.createMany({
+          data: closingPackagingStock.map((stock) => ({
+            tenantId,
+            deliveryRunId: id,
+            packagingTypeId: stock.packagingTypeId,
+            stockType: PrismaStockType.CLOSING,
+            filledCount: stock.filledCount,
+            emptyCount: stock.emptyCount,
+          })),
+        });
+      }
+
       await tx.deliveryRun.update({
         where: { id },
         data: {
@@ -574,21 +692,38 @@ export class DeliveryRunsService {
       },
     });
 
-    return { run: this.toDetail(closed), summary: await this.summary(id, tenantId) };
+    return { run: this.toDetail(closed), summary: await this.summary(id, tenantId, actorId) };
   }
 
-  async summary(id: string, tenantId: string) {
+  async summary(id: string, tenantId: string, actorId: string) {
     const run = await this.prisma.deliveryRun.findFirst({
       where: { id, tenantId },
       include: {
         stocks: { include: { product: { select: { id: true, name: true } } } },
+        packagingStocks: {
+          include: { packagingType: { select: { id: true, name: true } } },
+        },
         deliveries: {
           where: { status: { not: PrismaDeliveryStatus.CANCELLED } },
-          include: { items: { include: { product: { select: { id: true, name: true } } } } },
+          include: {
+            items: {
+              include: {
+                product: {
+                  select: {
+                    id: true,
+                    name: true,
+                    packagingTypeId: true,
+                    packagingType: { select: { id: true, name: true } },
+                  },
+                },
+              },
+            },
+          },
         },
       },
     });
     if (!run) throw new NotFoundException('Delivery run not found');
+    await this.assertRiderOwnsRun(tenantId, actorId, run.riderId);
 
     const products = new Map<
       string,
@@ -674,6 +809,78 @@ export class DeliveryRunsService {
       };
     });
 
+    const packaging = new Map<
+      string,
+      {
+        packagingTypeId: string;
+        name: string;
+        openingFilled: number;
+        openingEmpty: number;
+        closingFilled: number;
+        closingEmpty: number;
+        containersDelivered: number;
+        emptiesReturned: number;
+      }
+    >();
+    const ensurePkg = (packagingTypeId: string, name: string) => {
+      const existing = packaging.get(packagingTypeId);
+      if (existing) return existing;
+      const created = {
+        packagingTypeId,
+        name,
+        openingFilled: 0,
+        openingEmpty: 0,
+        closingFilled: 0,
+        closingEmpty: 0,
+        containersDelivered: 0,
+        emptiesReturned: 0,
+      };
+      packaging.set(packagingTypeId, created);
+      return created;
+    };
+
+    for (const stock of run.packagingStocks) {
+      const row = ensurePkg(stock.packagingTypeId, stock.packagingType.name);
+      if (stock.stockType === PrismaStockType.OPENING) {
+        row.openingFilled += stock.filledCount;
+        row.openingEmpty += stock.emptyCount;
+      } else {
+        row.closingFilled += stock.filledCount;
+        row.closingEmpty += stock.emptyCount;
+      }
+    }
+    for (const delivery of run.deliveries) {
+      for (const item of delivery.items) {
+        const typeId = item.product.packagingTypeId;
+        if (!typeId) continue;
+        const typeName = item.product.packagingType?.name ?? item.product.name;
+        const row = ensurePkg(typeId, typeName);
+        row.containersDelivered += item.containersDelivered;
+        row.emptiesReturned += item.emptiesReceived;
+      }
+    }
+
+    const packagingDiscrepancies = [...packaging.values()].map((row) => {
+      const expectedClosingFilled = row.openingFilled - row.containersDelivered;
+      const expectedClosingEmpty = row.openingEmpty + row.emptiesReturned;
+      return {
+        packagingTypeId: row.packagingTypeId,
+        name: row.name,
+        openingFilled: row.openingFilled,
+        openingEmpty: row.openingEmpty,
+        closingFilled: row.closingFilled,
+        closingEmpty: row.closingEmpty,
+        containersDelivered: row.containersDelivered,
+        emptiesReturned: row.emptiesReturned,
+        expectedClosingFilled,
+        expectedClosingEmpty,
+        filledDifference: row.closingFilled - expectedClosingFilled,
+        emptyDifference: row.closingEmpty - expectedClosingEmpty,
+        missingContainers:
+          expectedClosingFilled + expectedClosingEmpty - row.closingFilled - row.closingEmpty,
+      };
+    });
+
     const totalSales = run.deliveries.reduce(
       (sum, delivery) =>
         sum +
@@ -696,6 +903,7 @@ export class DeliveryRunsService {
       closingCash: run.closingCash == null ? null : closingCash,
       cashDifference: run.closingCash == null ? null : closingCash - expectedCash,
       productDiscrepancies,
+      packagingDiscrepancies,
     };
   }
 
@@ -734,6 +942,27 @@ export class DeliveryRunsService {
       select: { id: true },
     });
     if (!rider) throw new BadRequestException('Rider must be an active rider in this workspace');
+  }
+
+  /** Pure riders may only touch runs where they are the assigned rider. */
+  private async assertRiderOwnsRun(tenantId: string, actorId: string, runRiderId: string) {
+    const riderOnly = await isRiderOnlyUser(this.prisma, tenantId, actorId);
+    if (!riderOnly) return;
+    if (runRiderId !== actorId) {
+      throw new NotFoundException('Delivery run not found');
+    }
+  }
+
+  private async assertRiderCanAccessRunId(tenantId: string, runId: string, actorId: string) {
+    const riderOnly = await isRiderOnlyUser(this.prisma, tenantId, actorId);
+    if (!riderOnly) return;
+    const run = await this.prisma.deliveryRun.findFirst({
+      where: { id: runId, tenantId },
+      select: { riderId: true },
+    });
+    if (!run || run.riderId !== actorId) {
+      throw new NotFoundException('Delivery run not found');
+    }
   }
 
   private async assertVehicle(
@@ -831,28 +1060,18 @@ export class DeliveryRunsService {
     for (const line of args.lines) {
       if (!(line.qty > 0)) continue;
       const qty = new Prisma.Decimal(line.qty);
-      await this.applyWarehouseBalanceDelta(tx, {
+      const name = nameById.get(line.productId) ?? 'product';
+      await applyProductStockMovement(tx, {
         tenantId: args.tenantId,
         locationId: args.locationId,
         productId: line.productId,
-        delta: qty.neg(),
-        allowNegative: false,
-        productName: nameById.get(line.productId) ?? 'product',
-        loadQty: line.qty,
-      });
-
-      await tx.stockMovement.create({
-        data: {
-          tenantId: args.tenantId,
-          locationId: args.locationId,
-          productId: line.productId,
-          type: StockMovementType.TRANSFER_OUT,
-          quantity: qty.neg(),
-          reason: TRUCK_LOAD_REASON,
-          referenceType: DELIVERY_RUN_REF,
-          referenceId: args.runId,
-          createdByUserId: args.actorId,
-        },
+        type: StockMovementType.TRANSFER_OUT,
+        quantity: qty.neg(),
+        reason: TRUCK_LOAD_REASON,
+        referenceType: DELIVERY_RUN_REF,
+        referenceId: args.runId,
+        actorId: args.actorId,
+        insufficientMessage: `Cannot load ${line.qty} of "${name}" — only available qty at warehouse is too low`,
       });
     }
   }
@@ -869,16 +1088,12 @@ export class DeliveryRunsService {
       loadQty?: number;
     },
   ) {
-    const balance = await tx.stockBalance.findUnique({
-      where: {
-        tenantId_locationId_productId: {
-          tenantId: args.tenantId,
-          locationId: args.locationId,
-          productId: args.productId,
-        },
-      },
+    const balance = await lockStockBalance(tx, {
+      tenantId: args.tenantId,
+      locationId: args.locationId,
+      productId: args.productId,
     });
-    const current = balance ? new Prisma.Decimal(balance.quantity) : new Prisma.Decimal(0);
+    const current = new Prisma.Decimal(balance.quantity);
     const next = current.add(args.delta);
 
     if (!args.allowNegative && next.lessThan(0)) {
@@ -890,30 +1105,21 @@ export class DeliveryRunsService {
       );
     }
 
-    if (balance) {
-      await tx.stockBalance.update({
-        where: { id: balance.id },
-        data: { quantity: next },
-      });
-    } else {
-      await tx.stockBalance.create({
-        data: {
-          tenantId: args.tenantId,
-          locationId: args.locationId,
-          productId: args.productId,
-          quantity: next,
-        },
-      });
-    }
+    await tx.stockBalance.update({
+      where: { id: balance.id },
+      data: { quantity: next },
+    });
   }
 
   /**
    * Validate base qty + empties, resolve filledPackagingCount (explicit for LTR/KG returnable).
+   * When packagingMode: product can fields are zeroed — truck cans live on DeliveryRunPackagingStock.
    */
   private async withPackagingCounts(
     tx: Prisma.TransactionClient | PrismaService,
     tenantId: string,
     stock: DeliveryRunStockDto[],
+    packagingMode = false,
   ): Promise<Array<DeliveryRunStockDto & { filledPackagingCount: number }>> {
     if (stock.length === 0) return [];
 
@@ -931,6 +1137,7 @@ export class DeliveryRunsService {
         baseUnit: true,
         isReturnable: true,
         containerCapacity: true,
+        packagingTypeId: true,
       },
     });
     const byId = new Map(products.map((p) => [p.id, p]));
@@ -941,11 +1148,20 @@ export class DeliveryRunsService {
         throw new BadRequestException('One or more products are invalid for this workspace');
       }
       assertValidStockQuantity(row.filledCount, product, 'units loaded');
+
+      const trackContainers = containersEnabled && product.isReturnable;
+      if (packagingMode && trackContainers) {
+        return {
+          ...row,
+          emptyCount: 0,
+          filledPackagingCount: 0,
+        };
+      }
+
       if (!Number.isInteger(row.emptyCount)) {
         throw new BadRequestException(`Empty count for "${product.name}" must be a whole number`);
       }
 
-      const trackContainers = containersEnabled && product.isReturnable;
       const filledPackagingCount = trackContainers
         ? resolveFilledPackagingCount(product, row.filledCount, row.filledPackagingCount)
         : 0;
@@ -956,6 +1172,56 @@ export class DeliveryRunsService {
         filledPackagingCount,
       };
     });
+  }
+
+  private isPackagingStockMode(rows: DeliveryRunPackagingStockDto[] | undefined): boolean {
+    if (!rows || rows.length === 0) return false;
+    return rows.some((row) => row.filledCount > 0 || row.emptyCount > 0);
+  }
+
+  private async runHasPackagingStock(
+    tx: Prisma.TransactionClient | PrismaService,
+    tenantId: string,
+    deliveryRunId: string,
+  ): Promise<boolean> {
+    const count = await tx.deliveryRunPackagingStock.count({
+      where: {
+        tenantId,
+        deliveryRunId,
+        stockType: PrismaStockType.OPENING,
+      },
+    });
+    return count > 0;
+  }
+
+  private async normalizePackagingStock(
+    tx: Prisma.TransactionClient | PrismaService,
+    tenantId: string,
+    rows: DeliveryRunPackagingStockDto[],
+  ): Promise<DeliveryRunPackagingStockDto[]> {
+    if (!(await isReturnableContainersEnabled(tx, tenantId))) {
+      throw new BadRequestException('Returnable containers are disabled for this workspace');
+    }
+    const active = rows.filter((row) => row.filledCount > 0 || row.emptyCount > 0);
+    if (active.length === 0) return [];
+
+    this.assertUniquePackagingTypes(active);
+    const ids = active.map((row) => row.packagingTypeId);
+    const types = await tx.packagingType.findMany({
+      where: { tenantId, deletedAt: null, isActive: true, id: { in: ids } },
+      select: { id: true },
+    });
+    if (types.length !== ids.length) {
+      throw new BadRequestException('All packaging types must be active in this workspace');
+    }
+    return active;
+  }
+
+  private assertUniquePackagingTypes(stock: DeliveryRunPackagingStockDto[]): void {
+    const ids = stock.map((row) => row.packagingTypeId);
+    if (new Set(ids).size !== ids.length) {
+      throw new BadRequestException('Each packaging type can appear only once in stock');
+    }
   }
 
   private assertUniqueProducts(stock: DeliveryRunStockDto[]): void {
@@ -1031,27 +1297,16 @@ export class DeliveryRunsService {
     for (const line of args.lines) {
       if (!(line.qty > 0)) continue;
       const qty = new Prisma.Decimal(line.qty);
-      await this.applyWarehouseBalanceDelta(tx, {
+      await applyProductStockMovement(tx, {
         tenantId: args.tenantId,
         locationId: args.locationId,
         productId: line.productId,
-        delta: qty,
-        allowNegative: true,
-        productName: null,
-      });
-
-      await tx.stockMovement.create({
-        data: {
-          tenantId: args.tenantId,
-          locationId: args.locationId,
-          productId: line.productId,
-          type: StockMovementType.TRANSFER_IN,
-          quantity: qty,
-          reason: TRUCK_RETURN_REASON,
-          referenceType: DELIVERY_RUN_REF,
-          referenceId: args.runId,
-          createdByUserId: args.actorId,
-        },
+        type: StockMovementType.TRANSFER_IN,
+        quantity: qty,
+        reason: TRUCK_RETURN_REASON,
+        referenceType: DELIVERY_RUN_REF,
+        referenceId: args.runId,
+        actorId: args.actorId,
       });
     }
   }
@@ -1133,6 +1388,7 @@ export class DeliveryRunsService {
     tenantId: string,
     deliveryRunId: string,
     openingStock: Array<DeliveryRunStockDto & { filledPackagingCount: number }>,
+    packagingMode = false,
   ): Promise<void> {
     const productIds = openingStock.map((row) => row.productId);
     const [products, deliveries] = await Promise.all([
@@ -1183,10 +1439,65 @@ export class DeliveryRunsService {
           `Opening filled for "${name}" cannot be below already delivered qty (${delivered})`,
         );
       }
+      if (packagingMode) continue;
       const cansDelivered = cansDeliveredByProduct.get(stock.productId) ?? 0;
       if (stock.filledPackagingCount < cansDelivered) {
         throw new BadRequestException(
           `Opening cans for "${name}" cannot be below already delivered cans (${cansDelivered})`,
+        );
+      }
+    }
+  }
+
+  private async assertOpeningPackagingNotBelowDelivered(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    deliveryRunId: string,
+    packagingStock: DeliveryRunPackagingStockDto[],
+  ): Promise<void> {
+    const deliveries = await tx.delivery.findMany({
+      where: {
+        tenantId,
+        deliveryRunId,
+        status: { not: PrismaDeliveryStatus.CANCELLED },
+      },
+      select: {
+        items: {
+          select: {
+            containersDelivered: true,
+            product: {
+              select: {
+                packagingTypeId: true,
+                packagingType: { select: { name: true } },
+              },
+            },
+          },
+        },
+      },
+    });
+    const cansByType = new Map<string, number>();
+    const nameByType = new Map<string, string>();
+    for (const delivery of deliveries) {
+      for (const item of delivery.items) {
+        const typeId = item.product.packagingTypeId;
+        if (!typeId || item.containersDelivered <= 0) continue;
+        cansByType.set(typeId, (cansByType.get(typeId) ?? 0) + item.containersDelivered);
+        if (item.product.packagingType?.name) {
+          nameByType.set(typeId, item.product.packagingType.name);
+        }
+      }
+    }
+    if (cansByType.size === 0) return;
+
+    const filledByType = new Map(
+      packagingStock.map((row) => [row.packagingTypeId, row.filledCount]),
+    );
+    for (const [typeId, delivered] of cansByType) {
+      const filled = filledByType.get(typeId) ?? 0;
+      if (filled < delivered) {
+        const name = nameByType.get(typeId) ?? 'packaging';
+        throw new BadRequestException(
+          `Opening cans for "${name}" cannot be below already delivered cans (${delivered})`,
         );
       }
     }
@@ -1198,6 +1509,11 @@ export class DeliveryRunsService {
       vehicle: { select: { id: true, name: true, plateNumber: true, type: true } },
       loadLocation: { select: { id: true, name: true, isDefault: true } },
       stocks: { include: { product: { select: { id: true, name: true } } } },
+      packagingStocks: {
+        include: {
+          packagingType: { select: { id: true, name: true, capacity: true } },
+        },
+      },
       refillLoads: {
         include: {
           product: { select: { id: true, name: true } },
@@ -1216,6 +1532,37 @@ export class DeliveryRunsService {
         include: {
           customer: { select: { id: true, name: true, phone: true } },
           items: { include: { product: { select: { id: true, name: true } } } },
+        },
+      },
+      plannedStops: {
+        where: {
+          status: {
+            in: [PrismaPlannedStopStatus.INCLUDED, PrismaPlannedStopStatus.COMPLETED],
+          },
+        },
+        orderBy: [{ status: 'asc' as const }, { planDate: 'asc' as const }],
+        include: {
+          customer: {
+            select: {
+              id: true,
+              name: true,
+              phone: true,
+              areaId: true,
+              area: { select: { name: true } },
+            },
+          },
+          items: {
+            include: {
+              product: {
+                select: {
+                  id: true,
+                  name: true,
+                  baseUnit: true,
+                  allowFractionalQty: true,
+                },
+              },
+            },
+          },
         },
       },
     };
@@ -1294,6 +1641,21 @@ export class DeliveryRunsService {
         emptyCount: stock.emptyCount,
         product: stock.product,
       })),
+      packagingStocks: row.packagingStocks.map((stock) => ({
+        id: stock.id,
+        packagingTypeId: stock.packagingTypeId,
+        stockType: stock.stockType as StockType,
+        filledCount: stock.filledCount,
+        emptyCount: stock.emptyCount,
+        packagingType: {
+          id: stock.packagingType.id,
+          name: stock.packagingType.name,
+          capacity:
+            stock.packagingType.capacity == null
+              ? null
+              : Number(stock.packagingType.capacity.toString()),
+        },
+      })),
       refillLoads: row.refillLoads.map((load) => ({
         id: load.id,
         refillBatchId: load.refillBatchId,
@@ -1353,6 +1715,30 @@ export class DeliveryRunsService {
           updatedAt: delivery.updatedAt,
         };
       }),
+      plannedStops: row.plannedStops.map((stop) => ({
+        id: stop.id,
+        planDate: stop.planDate.toISOString().slice(0, 10),
+        customerId: stop.customerId,
+        customerName: stop.customer.name,
+        customerPhone: stop.customer.phone,
+        areaId: stop.customer.areaId,
+        areaName: stop.customer.area?.name ?? null,
+        deliveryRunId: stop.deliveryRunId,
+        deliveryId: stop.deliveryId,
+        status: stop.status,
+        source: stop.source,
+        skipReason: stop.skipReason,
+        failReason: stop.failReason,
+        items: stop.items.map((item) => ({
+          productId: item.productId,
+          productName: item.product.name,
+          baseUnit: item.product.baseUnit,
+          allowFractionalQty: item.product.allowFractionalQty,
+          plannedQuantity: decimalQtyToNumber(item.plannedQuantity),
+        })),
+        createdAt: stop.createdAt,
+        updatedAt: stop.updatedAt,
+      })),
     };
   }
 }

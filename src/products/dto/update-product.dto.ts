@@ -9,6 +9,7 @@ import {
   MaxLength,
   Min,
   MinLength,
+  ValidateIf,
 } from 'class-validator';
 import { Transform, Type } from 'class-transformer';
 import { ProductBaseUnit } from '../../common/enums/product.enum';
@@ -75,6 +76,16 @@ export class UpdateProductDto {
   @IsNumber({ maxDecimalPlaces: 2 })
   @Min(0)
   containerCapacity?: number | null;
+
+  @ApiPropertyOptional({
+    description: 'Shared packaging type. Required when returnable and containers flag is ON.',
+    nullable: true,
+  })
+  @IsOptional()
+  @ValidateIf((_, v) => v != null && v !== '')
+  @IsString()
+  @MinLength(1)
+  packagingTypeId?: string | null;
 
   @ApiPropertyOptional({ example: false })
   @IsOptional()

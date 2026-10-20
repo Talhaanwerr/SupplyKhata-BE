@@ -14,6 +14,7 @@ import { getPaginationParams, buildPaginationMeta } from '../common/helpers/pagi
 import { clearPromisedDueIfSettled } from '../common/helpers/promised-due.helper';
 import { assertOrdersEnabled } from '../common/helpers/orders.helper';
 import { isInventoryEnabled } from '../common/helpers/inventory.helper';
+import { lockStockBalance } from '../common/helpers/stock-lock.helper';
 import {
   computeOrderTotals,
   decimalToNumber,
@@ -23,6 +24,7 @@ import {
 } from '../common/helpers/order-money.helper';
 import { assertValidBaseQuantity } from '../common/helpers/product-qty.helper';
 import {
+  assertProductPackaging,
   isReturnableContainersEnabled,
   packagingUnitsOutForDelivery,
   RETURNABLE_CONTAINERS_DISABLED_MESSAGE,
@@ -38,7 +40,9 @@ import { ListOrdersQueryDto } from './dto/list-orders-query.dto';
 import { DeliverOrderDto } from './dto/deliver-order.dto';
 import { CancelOrderDto } from './dto/cancel-order.dto';
 import { RecordOrderPaymentDto } from './dto/record-order-payment.dto';
+import { ApplyOrderPaymentDto } from './dto/apply-order-payment.dto';
 import { RefundOrderDto } from './dto/refund-order.dto';
+
 import {
   endOfTodayInTimeZoneUtc,
   parseCalendarDateUtc,
@@ -594,6 +598,7 @@ export class OrdersService {
         isReturnable: true,
         allowFractionalQty: true,
         containerCapacity: true,
+        packagingTypeId: true,
       },
     });
     const productMap = new Map(products.map((p) => [p.id, p]));
@@ -619,6 +624,9 @@ export class OrdersService {
       assertValidBaseQuantity(row.quantityDelivered, product);
 
       const trackContainers = containersEnabled && product.isReturnable;
+      if (trackContainers) {
+        assertProductPackaging(product);
+      }
       const rawEmpties = row.emptiesReceived ?? 0;
       if (!trackContainers && rawEmpties > 0) {
         throw new BadRequestException(
@@ -655,6 +663,7 @@ export class OrdersService {
     const lineUpdates: Array<{
       id: string;
       productId: string;
+      packagingTypeId: string | null;
       quantityDelivered: number;
       containersDelivered: number;
       emptiesReceived: number;
@@ -680,6 +689,7 @@ export class OrdersService {
       if (!add || addQty <= 0) continue;
 
       const trackContainers = containersEnabled && product.isReturnable;
+      const packagingTypeId = trackContainers ? assertProductPackaging(product) : null;
       // First handoff: replace planned cans with actual; later handoffs accumulate.
       const nextCans =
         currentQty === 0
@@ -690,6 +700,7 @@ export class OrdersService {
       lineUpdates.push({
         id: item.id,
         productId: item.productId,
+        packagingTypeId,
         quantityDelivered: nextQty,
         containersDelivered: nextCans,
         emptiesReceived: nextEmpties,
@@ -718,11 +729,12 @@ export class OrdersService {
 
       const movements: Prisma.ContainerMovementCreateManyInput[] = [];
       for (const row of lineUpdates) {
-        if (!row.trackContainers) continue;
+        if (!row.trackContainers || !row.packagingTypeId) continue;
         if (row.packagingUnitsOut > 0) {
           movements.push({
             tenantId,
             productId: row.productId,
+            packagingTypeId: row.packagingTypeId,
             customerId: existing.customerId,
             movementType: PrismaContainerMovementType.DELIVERED_TO_CUSTOMER,
             quantity: row.packagingUnitsOut,
@@ -733,6 +745,7 @@ export class OrdersService {
           movements.push({
             tenantId,
             productId: row.productId,
+            packagingTypeId: row.packagingTypeId,
             customerId: existing.customerId,
             movementType: PrismaContainerMovementType.RETURNED_FROM_CUSTOMER,
             quantity: row.emptiesThisCall,
@@ -953,8 +966,158 @@ export class OrdersService {
   }
 
   /**
+   * Customer payments with remaining unallocated amount (not linked to non-refunded orders).
+   * Used by "Apply existing payment to order" — no new ledger.
+   */
+  async listAllocatablePayments(id: string, tenantId: string) {
+    await assertOrdersEnabled(this.prisma, tenantId);
+
+    const order = await this.requireOrder(id, tenantId);
+    const payments = await this.prisma.payment.findMany({
+      where: { tenantId, customerId: order.customerId },
+      orderBy: { paymentDate: 'desc' },
+      take: 50,
+    });
+    if (payments.length === 0) return [];
+
+    const paymentIds = payments.map((p) => p.id);
+    const allocations = await this.prisma.orderPayment.findMany({
+      where: {
+        tenantId,
+        paymentId: { in: paymentIds },
+        order: { status: { not: PrismaOrderStatus.REFUNDED } },
+      },
+      select: { paymentId: true, amount: true },
+    });
+
+    const allocatedByPayment = new Map<string, number>();
+    for (const row of allocations) {
+      if (!row.paymentId) continue;
+      const prev = allocatedByPayment.get(row.paymentId) ?? 0;
+      allocatedByPayment.set(row.paymentId, roundMoney(prev + decimalToNumber(row.amount)));
+    }
+
+    return payments
+      .map((p) => {
+        const amount = decimalToNumber(p.amount);
+        const allocated = allocatedByPayment.get(p.id) ?? 0;
+        const unallocated = roundMoney(Math.max(0, amount - allocated));
+        return {
+          id: p.id,
+          amount,
+          unallocated,
+          method: p.method as PaymentMethod,
+          paymentDate: p.paymentDate,
+          reference: p.reference,
+          notes: p.notes,
+        };
+      })
+      .filter((p) => p.unallocated > 0.00001);
+  }
+
+  /**
+   * Link an existing Payment to this order without creating Payment or ledger rows.
+   * amountPaid / amountDue / paymentStatus update only.
+   */
+  async applyPayment(id: string, tenantId: string, dto: ApplyOrderPaymentDto, actorId: string) {
+    await assertOrdersEnabled(this.prisma, tenantId);
+
+    const existing = await this.requireOrder(id, tenantId);
+    const payableStatuses: PrismaOrderStatus[] = [
+      PrismaOrderStatus.PLACED,
+      PrismaOrderStatus.SHIPPED,
+      PrismaOrderStatus.PARTIALLY_DELIVERED,
+      PrismaOrderStatus.DELIVERED,
+    ];
+    if (!payableStatuses.includes(existing.status as PrismaOrderStatus)) {
+      throw new BadRequestException('Payments can only be applied on open placed orders');
+    }
+
+    const amountPaid = decimalToNumber(existing.amountPaid);
+    const total = decimalToNumber(existing.total);
+    const amountDue = roundMoney(Math.max(0, total - amountPaid));
+    if (amountDue <= 0) {
+      throw new BadRequestException('Order has no amount due');
+    }
+
+    const payment = await this.prisma.payment.findFirst({
+      where: { id: dto.paymentId, tenantId, customerId: existing.customerId },
+    });
+    if (!payment) {
+      throw new NotFoundException('Payment not found for this customer');
+    }
+
+    const priorAllocations = await this.prisma.orderPayment.findMany({
+      where: {
+        tenantId,
+        paymentId: payment.id,
+        order: { status: { not: PrismaOrderStatus.REFUNDED } },
+      },
+      select: { amount: true },
+    });
+    const allocated = roundMoney(
+      priorAllocations.reduce((sum, row) => sum + decimalToNumber(row.amount), 0),
+    );
+    const unallocated = roundMoney(Math.max(0, decimalToNumber(payment.amount) - allocated));
+    if (dto.amount > unallocated + 0.00001) {
+      throw new BadRequestException(`Amount exceeds unallocated payment balance (${unallocated})`);
+    }
+    if (dto.amount > amountDue + 0.00001) {
+      throw new BadRequestException('Payment amount exceeds amount due');
+    }
+
+    const nextPaid = roundMoney(amountPaid + dto.amount);
+    const nextDue = roundMoney(Math.max(0, total - nextPaid));
+    const paymentStatus = recomputePaymentStatus(nextPaid, total);
+    const paidAt = new Date();
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.orderPayment.create({
+        data: {
+          tenantId,
+          orderId: id,
+          paymentId: payment.id,
+          method: payment.method,
+          amount: new Prisma.Decimal(dto.amount),
+          paidAt,
+          createdById: actorId,
+        },
+      });
+
+      await tx.customerOrder.update({
+        where: { id },
+        data: {
+          amountPaid: new Prisma.Decimal(nextPaid),
+          amountDue: new Prisma.Decimal(nextDue),
+          paymentStatus,
+        },
+      });
+
+      await clearPromisedDueIfSettled(tx, tenantId, existing.customerId);
+    });
+
+    await this.audit.write({
+      tenantId,
+      actorId,
+      module: 'orders',
+      action: 'APPLY_PAYMENT',
+      entityId: id,
+      newValue: {
+        paymentId: payment.id,
+        amount: dto.amount,
+        amountPaid: nextPaid,
+        paymentStatus,
+        ledgerCreated: false,
+      },
+    });
+
+    return this.findOne(id, tenantId);
+  }
+
+  /**
    * v1 FULL refund only: amount must equal amountPaid.
-   * Reverses ORDER_SALE + order PAYMENT ledger rows via ADJUSTMENT (same pattern as delivery cancel).
+   * Reverses ORDER_SALE + order-native PAYMENT ledger rows via ADJUSTMENT.
+   * Applied (standalone) payments are not reversed — their ledger credit stays.
    */
   async refund(id: string, tenantId: string, dto: RefundOrderDto, actorId: string) {
     await assertOrdersEnabled(this.prisma, tenantId);
@@ -995,17 +1158,39 @@ export class OrdersService {
         },
       });
 
-      const paymentEntries =
-        paymentIds.length > 0
-          ? await tx.customerLedgerEntry.findMany({
-              where: {
-                tenantId,
-                referenceType: 'payment',
-                referenceId: { in: paymentIds },
-                entryType: PrismaLedgerEntryType.PAYMENT,
-              },
-            })
-          : [];
+      // Only reverse ledger for payments created by Record payment on this order.
+      // Applied standalone payments must keep their original PAYMENT credit.
+      let paymentEntries: Array<{
+        customerId: string;
+        amount: Prisma.Decimal;
+        referenceId: string | null;
+        referenceType: string | null;
+        entryType: PrismaLedgerEntryType;
+      }> = [];
+      if (paymentIds.length > 0) {
+        const linkedPayments = await tx.payment.findMany({
+          where: { id: { in: paymentIds }, tenantId },
+          select: { id: true, reference: true, notes: true },
+        });
+        const orderRef = `ORD-${existing.orderNumber}`;
+        const orderNote = `Order #${existing.orderNumber}`;
+        const nativeIds = linkedPayments
+          .filter(
+            (p) => p.reference === orderRef || (p.notes != null && p.notes.includes(orderNote)),
+          )
+          .map((p) => p.id);
+
+        if (nativeIds.length > 0) {
+          paymentEntries = await tx.customerLedgerEntry.findMany({
+            where: {
+              tenantId,
+              referenceType: 'payment',
+              referenceId: { in: nativeIds },
+              entryType: PrismaLedgerEntryType.PAYMENT,
+            },
+          });
+        }
+      }
 
       const toReverse = [...saleEntries, ...paymentEntries];
       if (toReverse.length > 0) {
@@ -1241,16 +1426,12 @@ export class OrdersService {
 
     for (const [productId, { qty, name }] of qtyByProduct) {
       const dec = new Prisma.Decimal(qty);
-      const balance = await tx.stockBalance.findUnique({
-        where: {
-          tenantId_locationId_productId: {
-            tenantId: args.tenantId,
-            locationId: args.locationId,
-            productId,
-          },
-        },
+      const balance = await lockStockBalance(tx, {
+        tenantId: args.tenantId,
+        locationId: args.locationId,
+        productId,
       });
-      const current = balance ? new Prisma.Decimal(balance.quantity) : new Prisma.Decimal(0);
+      const current = new Prisma.Decimal(balance.quantity);
       const next = current.sub(dec);
       if (next.lessThan(0)) {
         throw new BadRequestException(
@@ -1258,21 +1439,10 @@ export class OrdersService {
         );
       }
 
-      if (balance) {
-        await tx.stockBalance.update({
-          where: { id: balance.id },
-          data: { quantity: next },
-        });
-      } else {
-        await tx.stockBalance.create({
-          data: {
-            tenantId: args.tenantId,
-            locationId: args.locationId,
-            productId,
-            quantity: next,
-          },
-        });
-      }
+      await tx.stockBalance.update({
+        where: { id: balance.id },
+        data: { quantity: next },
+      });
 
       await tx.stockMovement.create({
         data: {
@@ -1307,33 +1477,17 @@ export class OrdersService {
 
     for (const m of outs) {
       const restore = new Prisma.Decimal(m.quantity).neg();
-      const balance = await tx.stockBalance.findUnique({
-        where: {
-          tenantId_locationId_productId: {
-            tenantId,
-            locationId: m.locationId,
-            productId: m.productId,
-          },
-        },
+      const balance = await lockStockBalance(tx, {
+        tenantId,
+        locationId: m.locationId,
+        productId: m.productId,
       });
-      const current = balance ? new Prisma.Decimal(balance.quantity) : new Prisma.Decimal(0);
-      const next = current.add(restore);
+      const next = new Prisma.Decimal(balance.quantity).add(restore);
 
-      if (balance) {
-        await tx.stockBalance.update({
-          where: { id: balance.id },
-          data: { quantity: next },
-        });
-      } else {
-        await tx.stockBalance.create({
-          data: {
-            tenantId,
-            locationId: m.locationId,
-            productId: m.productId,
-            quantity: next,
-          },
-        });
-      }
+      await tx.stockBalance.update({
+        where: { id: balance.id },
+        data: { quantity: next },
+      });
 
       await tx.stockMovement.delete({ where: { id: m.id } });
     }

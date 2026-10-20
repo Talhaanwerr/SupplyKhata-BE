@@ -14,6 +14,7 @@ import { ListOrdersQueryDto } from './dto/list-orders-query.dto';
 import { DeliverOrderDto } from './dto/deliver-order.dto';
 import { CancelOrderDto } from './dto/cancel-order.dto';
 import { RecordOrderPaymentDto } from './dto/record-order-payment.dto';
+import { ApplyOrderPaymentDto } from './dto/apply-order-payment.dto';
 import { RefundOrderDto } from './dto/refund-order.dto';
 
 @UseGuards(JwtAuthGuard, TenantGuard, PermissionsGuard)
@@ -31,6 +32,12 @@ export class OrdersController {
   @RequirePermissions('orders:read')
   timeline(@Param('id') id: string, @CurrentTenant() tenantId: string) {
     return this.ordersService.timeline(id, tenantId);
+  }
+
+  @Get(':id/allocatable-payments')
+  @RequirePermissions('orders:read')
+  listAllocatablePayments(@Param('id') id: string, @CurrentTenant() tenantId: string) {
+    return this.ordersService.listAllocatablePayments(id, tenantId);
   }
 
   @Get(':id')
@@ -122,6 +129,17 @@ export class OrdersController {
     @CurrentUser() user: AuthenticatedUser,
   ) {
     return this.ordersService.recordPayment(id, tenantId, dto, user.id);
+  }
+
+  @Post(':id/apply-payment')
+  @RequirePermissions('orders:update')
+  applyPayment(
+    @Param('id') id: string,
+    @Body() dto: ApplyOrderPaymentDto,
+    @CurrentTenant() tenantId: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.ordersService.applyPayment(id, tenantId, dto, user.id);
   }
 
   @Post(':id/refund')

@@ -7,6 +7,7 @@ import {
   Body,
   Param,
   Query,
+  Headers,
   UseGuards,
   HttpCode,
   HttpStatus,
@@ -18,6 +19,8 @@ import { RequirePermissions } from '../common/decorators/permissions.decorator';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { CurrentTenant } from '../common/decorators/current-tenant.decorator';
 import { AuthenticatedUser } from '../auth/types/jwt-payload.type';
+import { PrismaService } from '../prisma/prisma.service';
+import { runIdempotent } from '../common/helpers/idempotency.helper';
 import { PaymentsService } from './payments.service';
 import { CreatePaymentDto } from './dto/create-payment.dto';
 import { UpdatePaymentDto } from './dto/update-payment.dto';
@@ -26,7 +29,10 @@ import { ListPaymentsQueryDto } from './dto/list-payments-query.dto';
 @UseGuards(JwtAuthGuard, TenantGuard, PermissionsGuard)
 @Controller({ path: 'payments', version: '1' })
 export class PaymentsController {
-  constructor(private readonly paymentsService: PaymentsService) {}
+  constructor(
+    private readonly paymentsService: PaymentsService,
+    private readonly prisma: PrismaService,
+  ) {}
 
   @Get('dashboard')
   @RequirePermissions('payments:read')
@@ -52,8 +58,13 @@ export class PaymentsController {
     @Body() dto: CreatePaymentDto,
     @CurrentTenant() tenantId: string,
     @CurrentUser() user: AuthenticatedUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.paymentsService.create(tenantId, dto, user.id);
+    return runIdempotent(
+      this.prisma,
+      { tenantId, scope: 'payments:create', key: idempotencyKey },
+      () => this.paymentsService.create(tenantId, dto, user.id),
+    );
   }
 
   @Patch(':id')

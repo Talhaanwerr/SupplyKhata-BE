@@ -1,18 +1,33 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
-import { DeliveryStatus as PrismaDeliveryStatus, Prisma } from '@prisma/client';
+import {
+  DeliveryStatus as PrismaDeliveryStatus,
+  OrderStatus as PrismaOrderStatus,
+  Prisma,
+} from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { PaymentsService } from '../payments/payments.service';
 import { CashHandoversService } from '../cash-handovers/cash-handovers.service';
 import { DashboardQueryDto } from './dto/dashboard-query.dto';
+import { isOrdersEnabled } from '../common/helpers/orders.helper';
 import {
   endOfUtcDay,
+  endOfZonedDayUtc,
   formatCalendarDateUtc,
   parseCalendarDateUtc,
   startOfTodayInTimeZoneUtc,
+  startOfZonedDayUtc,
 } from '../common/helpers/calendar-utc.helper';
 import { getTenantTimezone } from '../common/helpers/tenant-timezone.helper';
 
 type DecimalLike = Prisma.Decimal | number | null | undefined;
+
+/** Fulfillment statuses that count as order sales (ORDER_SALE posted). */
+const BILLABLE_ORDER_STATUSES: PrismaOrderStatus[] = [
+  PrismaOrderStatus.PLACED,
+  PrismaOrderStatus.SHIPPED,
+  PrismaOrderStatus.PARTIALLY_DELIVERED,
+  PrismaOrderStatus.DELIVERED,
+];
 
 function decimalToNumber(value: DecimalLike): number {
   if (value == null) return 0;
@@ -41,6 +56,22 @@ function endOfMonth(d: Date): Date {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0, 23, 59, 59, 999));
 }
 
+type ProductAgg = {
+  productId: string;
+  name: string;
+  unitsDelivered: number;
+  revenue: number;
+  cogs: number;
+};
+
+type PeriodStats = {
+  totalUnits: number;
+  totalSales: number;
+  totalCogs: number;
+  cashCollected: number;
+  byProduct: ProductAgg[];
+};
+
 @Injectable()
 export class DashboardService {
   constructor(
@@ -55,10 +86,18 @@ export class DashboardService {
     const dayEnd = endOfDay(day);
     const monthStart = startOfMonth(day);
     const monthEnd = endOfMonth(day);
+    const dayYmd = formatCalendarDateUtc(day);
+    const monthFromYmd = formatCalendarDateUtc(monthStart);
+    const monthToYmd = formatCalendarDateUtc(monthEnd);
+    const ordersOn = await isOrdersEnabled(this.prisma, tenantId);
 
     const [
       todayDeliveries,
       monthDeliveries,
+      todayOrders,
+      monthOrders,
+      todayOrderCash,
+      monthOrderCash,
       todayExpensesAgg,
       monthExpensesAgg,
       monthRefillsAgg,
@@ -68,6 +107,12 @@ export class DashboardService {
     ] = await Promise.all([
       this.loadDeliveries(tenantId, day, dayEnd),
       this.loadDeliveries(tenantId, monthStart, monthEnd),
+      ordersOn ? this.loadBillableOrders(tenantId, dayYmd, dayYmd, tz) : Promise.resolve([]),
+      ordersOn
+        ? this.loadBillableOrders(tenantId, monthFromYmd, monthToYmd, tz)
+        : Promise.resolve([]),
+      ordersOn ? this.sumOrderPayments(tenantId, dayYmd, dayYmd, tz) : Promise.resolve(0),
+      ordersOn ? this.sumOrderPayments(tenantId, monthFromYmd, monthToYmd, tz) : Promise.resolve(0),
       this.prisma.expense.aggregate({
         where: { tenantId, date: { gte: day, lte: dayEnd } },
         _sum: { amount: true },
@@ -85,8 +130,16 @@ export class DashboardService {
       this.riderRows(tenantId, day, dayEnd),
     ]);
 
-    const todayStats = this.aggregatePeriod(todayDeliveries);
-    const monthStats = this.aggregatePeriod(monthDeliveries);
+    const todayStats = this.mergePeriodStats(
+      this.aggregateDeliveries(todayDeliveries),
+      this.aggregateOrders(todayOrders),
+      todayOrderCash,
+    );
+    const monthStats = this.mergePeriodStats(
+      this.aggregateDeliveries(monthDeliveries),
+      this.aggregateOrders(monthOrders),
+      monthOrderCash,
+    );
     const operatingExpenses = round2(decimalToNumber(monthExpensesAgg._sum.amount));
     const refillCOGS = round2(decimalToNumber(monthRefillsAgg._sum.totalCost));
     const grossProfit = round2(monthStats.totalSales - monthStats.totalCogs);
@@ -163,11 +216,83 @@ export class DashboardService {
     });
   }
 
-  private aggregatePeriod(deliveries: Awaited<ReturnType<DashboardService['loadDeliveries']>>) {
-    const byProduct = new Map<
-      string,
-      { productId: string; name: string; unitsDelivered: number; revenue: number; cogs: number }
-    >();
+  /**
+   * Orders whose PLACED event falls in the tenant-local calendar range
+   * (same recognition as Reports → Order sales).
+   */
+  private async loadBillableOrders(
+    tenantId: string,
+    fromYmd: string,
+    toYmd: string,
+    timeZone: string,
+  ) {
+    const fromAt = startOfZonedDayUtc(fromYmd, timeZone);
+    const toAt = endOfZonedDayUtc(toYmd, timeZone);
+
+    const placedEvents = await this.prisma.orderStatusEvent.findMany({
+      where: {
+        tenantId,
+        toStatus: PrismaOrderStatus.PLACED,
+        at: { gte: fromAt, lte: toAt },
+        order: {
+          tenantId,
+          deletedAt: null,
+          status: { in: BILLABLE_ORDER_STATUSES },
+        },
+      },
+      select: { orderId: true },
+      distinct: ['orderId'],
+    });
+    const orderIds = placedEvents.map((e) => e.orderId);
+    if (orderIds.length === 0) return [];
+
+    return this.prisma.customerOrder.findMany({
+      where: {
+        tenantId,
+        id: { in: orderIds },
+        deletedAt: null,
+        status: { in: BILLABLE_ORDER_STATUSES },
+      },
+      select: {
+        id: true,
+        total: true,
+        items: {
+          select: {
+            productId: true,
+            quantity: true,
+            lineTotal: true,
+            costSnapshot: true,
+            product: { select: { id: true, name: true } },
+          },
+        },
+      },
+    });
+  }
+
+  /** Payments recorded against orders in the tenant-local day range. */
+  private async sumOrderPayments(
+    tenantId: string,
+    fromYmd: string,
+    toYmd: string,
+    timeZone: string,
+  ): Promise<number> {
+    const fromAt = startOfZonedDayUtc(fromYmd, timeZone);
+    const toAt = endOfZonedDayUtc(toYmd, timeZone);
+    const agg = await this.prisma.orderPayment.aggregate({
+      where: {
+        tenantId,
+        paidAt: { gte: fromAt, lte: toAt },
+        order: { tenantId, deletedAt: null },
+      },
+      _sum: { amount: true },
+    });
+    return round2(decimalToNumber(agg._sum.amount));
+  }
+
+  private aggregateDeliveries(
+    deliveries: Awaited<ReturnType<DashboardService['loadDeliveries']>>,
+  ): PeriodStats {
+    const byProduct = new Map<string, ProductAgg>();
     let totalSales = 0;
     let totalCogs = 0;
     let totalUnits = 0;
@@ -196,6 +321,78 @@ export class DashboardService {
       }
     }
 
+    return this.finalizePeriod(byProduct, totalUnits, totalSales, totalCogs, cashCollected);
+  }
+
+  private aggregateOrders(
+    orders: Awaited<ReturnType<DashboardService['loadBillableOrders']>>,
+  ): PeriodStats {
+    const byProduct = new Map<string, ProductAgg>();
+    let totalSales = 0;
+    let totalCogs = 0;
+    let totalUnits = 0;
+
+    for (const order of orders) {
+      // Order total includes delivery charges (matches ORDER_SALE / Reports).
+      totalSales += decimalToNumber(order.total);
+      for (const item of order.items) {
+        const units = decimalToNumber(item.quantity);
+        const revenue = decimalToNumber(item.lineTotal);
+        const cogs = item.costSnapshot != null ? units * decimalToNumber(item.costSnapshot) : 0;
+        totalUnits += units;
+        totalCogs += cogs;
+        const prev = byProduct.get(item.productId) ?? {
+          productId: item.productId,
+          name: item.product.name,
+          unitsDelivered: 0,
+          revenue: 0,
+          cogs: 0,
+        };
+        prev.unitsDelivered += units;
+        prev.revenue += revenue;
+        prev.cogs += cogs;
+        byProduct.set(item.productId, prev);
+      }
+    }
+
+    return this.finalizePeriod(byProduct, totalUnits, totalSales, totalCogs, 0);
+  }
+
+  private mergePeriodStats(
+    delivery: PeriodStats,
+    orders: PeriodStats,
+    orderPaymentsCollected: number,
+  ): PeriodStats {
+    const byProduct = new Map<string, ProductAgg>();
+    for (const p of [...delivery.byProduct, ...orders.byProduct]) {
+      const prev = byProduct.get(p.productId) ?? {
+        productId: p.productId,
+        name: p.name,
+        unitsDelivered: 0,
+        revenue: 0,
+        cogs: 0,
+      };
+      prev.unitsDelivered += p.unitsDelivered;
+      prev.revenue += p.revenue;
+      prev.cogs += p.cogs;
+      byProduct.set(p.productId, prev);
+    }
+    return this.finalizePeriod(
+      byProduct,
+      delivery.totalUnits + orders.totalUnits,
+      delivery.totalSales + orders.totalSales,
+      delivery.totalCogs + orders.totalCogs,
+      delivery.cashCollected + orderPaymentsCollected,
+    );
+  }
+
+  private finalizePeriod(
+    byProduct: Map<string, ProductAgg>,
+    totalUnits: number,
+    totalSales: number,
+    totalCogs: number,
+    cashCollected: number,
+  ): PeriodStats {
     return {
       totalUnits,
       totalSales: round2(totalSales),

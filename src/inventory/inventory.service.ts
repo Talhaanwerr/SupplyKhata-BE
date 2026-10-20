@@ -1,4 +1,4 @@
-import {
+﻿import {
   BadRequestException,
   ForbiddenException,
   Injectable,
@@ -9,6 +9,8 @@ import { randomUUID } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { parseCalendarDateUtc } from '../common/helpers/calendar-utc.helper';
 import { AuditLogsService } from '../audit-logs/audit-logs.service';
+import { NotificationsService } from '../notifications/notifications.service';
+import { NotificationType } from '../notifications/dto/create-notification.dto';
 import { getPaginationParams, buildPaginationMeta } from '../common/helpers/pagination.helper';
 import {
   assertInventoryEnabled,
@@ -16,6 +18,9 @@ import {
   isWarehouseEnabled,
   WAREHOUSE_DISABLED_MESSAGE,
 } from '../common/helpers/inventory.helper';
+import { applyProductStockMovement } from '../common/helpers/stock-apply.helper';
+import { isRawMaterialsEnabled } from '../common/helpers/raw-materials.helper';
+
 import { CreateStockLocationDto, UpdateStockLocationDto } from './dto/stock-location.dto';
 import { PostAdjustmentDto, PostOpeningStockDto, PostTransferDto } from './dto/stock-movements.dto';
 import {
@@ -32,7 +37,7 @@ function decimalToNumber(value: DecimalLike): number {
 }
 
 function parseDate(value: string): Date {
-  const parsed = new Date(value);
+  const parsed = parseCalendarDateUtc(value, false);
   if (Number.isNaN(parsed.getTime())) {
     throw new BadRequestException('Invalid date');
   }
@@ -70,9 +75,68 @@ export class InventoryService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditLogsService,
+    private readonly notifications: NotificationsService,
   ) {}
 
   // ---
+
+  /**
+   * Create one WARNING notification for the current user summarizing low-stock rows.
+   * Does not auto-push on every stock move (keeps v1 simple).
+   */
+  async notifyLowStockAlerts(tenantId: string, userId: string) {
+    await assertInventoryEnabled(this.prisma, tenantId);
+
+    const productRows = await this.prisma.$queryRaw<Array<{ total: bigint | number }>>`
+      SELECT COUNT(*) AS total
+      FROM stock_balances sb
+      INNER JOIN products p ON p.id = sb.productId
+      WHERE sb.tenantId = ${tenantId}
+        AND p.reorderLevel IS NOT NULL
+        AND sb.quantity <= p.reorderLevel
+    `;
+    const productLow = Number(productRows[0]?.total ?? 0);
+
+    let rawLow = 0;
+    if (await isRawMaterialsEnabled(this.prisma, tenantId)) {
+      const rawRows = await this.prisma.$queryRaw<Array<{ total: bigint | number }>>`
+        SELECT COUNT(*) AS total
+        FROM raw_material_balances rmb
+        INNER JOIN raw_materials rm ON rm.id = rmb.rawMaterialId
+        WHERE rmb.tenantId = ${tenantId}
+          AND rm.reorderLevel IS NOT NULL
+          AND rmb.quantity <= rm.reorderLevel
+      `;
+      rawLow = Number(rawRows[0]?.total ?? 0);
+    }
+
+    if (productLow === 0 && rawLow === 0) {
+      return {
+        notified: false,
+        productLow: 0,
+        rawLow: 0,
+        message: 'No low-stock items',
+      };
+    }
+
+    await this.notifications.create(
+      {
+        userId,
+        title: 'Low stock alert',
+        body: `${productLow} product balance(s) and ${rawLow} raw material balance(s) are at or below reorder level.`,
+        type: NotificationType.WARNING,
+        link: '/inventory/alerts',
+      },
+      tenantId,
+    );
+
+    return {
+      notified: true,
+      productLow,
+      rawLow,
+      message: 'Notification created',
+    };
+  }
 
   async listLocations(tenantId: string, query: ListLocationsQueryDto) {
     await assertInventoryEnabled(this.prisma, tenantId);
@@ -193,15 +257,79 @@ export class InventoryService {
       if (activeCount <= 1) locationId = defaultLoc.id;
     }
 
+    const balanceInclude = {
+      product: {
+        select: {
+          id: true,
+          name: true,
+          sku: true,
+          baseUnit: true,
+          reorderLevel: true,
+        },
+      },
+      location: { select: locationSelect },
+    } as const;
+
+    // Prisma cannot express quantity <= product.reorderLevel; use SQL JOIN + LIMIT/OFFSET.
+    if (query.lowStockOnly) {
+      const locationFilter = locationId
+        ? Prisma.sql`AND sb.locationId = ${locationId}`
+        : Prisma.empty;
+      const productFilter = query.productId
+        ? Prisma.sql`AND sb.productId = ${query.productId}`
+        : Prisma.empty;
+
+      const [countRows, idRows] = await Promise.all([
+        this.prisma.$queryRaw<Array<{ total: bigint | number }>>`
+          SELECT COUNT(*) AS total
+          FROM stock_balances sb
+          INNER JOIN products p ON p.id = sb.productId
+          WHERE sb.tenantId = ${tenantId}
+            AND p.reorderLevel IS NOT NULL
+            AND sb.quantity <= p.reorderLevel
+            ${locationFilter}
+            ${productFilter}
+        `,
+        this.prisma.$queryRaw<Array<{ id: string }>>`
+          SELECT sb.id AS id
+          FROM stock_balances sb
+          INNER JOIN products p ON p.id = sb.productId
+          WHERE sb.tenantId = ${tenantId}
+            AND p.reorderLevel IS NOT NULL
+            AND sb.quantity <= p.reorderLevel
+            ${locationFilter}
+            ${productFilter}
+          ORDER BY sb.updatedAt DESC
+          LIMIT ${take} OFFSET ${skip}
+        `,
+      ]);
+
+      const total = Number(countRows[0]?.total ?? 0);
+      const ids = idRows.map((r) => r.id);
+      if (ids.length === 0) {
+        return { items: [], meta: buildPaginationMeta(total, page, limit) };
+      }
+
+      const rows = await this.prisma.stockBalance.findMany({
+        where: { id: { in: ids } },
+        include: balanceInclude,
+      });
+      const byId = new Map(rows.map((r) => [r.id, r]));
+      const items = ids
+        .map((id) => byId.get(id))
+        .filter((r): r is NonNullable<typeof r> => r != null)
+        .map((r) => this.mapBalance(r));
+
+      return {
+        items,
+        meta: buildPaginationMeta(total, page, limit),
+      };
+    }
+
     const where: Prisma.StockBalanceWhereInput = {
       tenantId,
       ...(locationId ? { locationId } : {}),
       ...(query.productId ? { productId: query.productId } : {}),
-      ...(query.lowStockOnly
-        ? {
-            product: { reorderLevel: { not: null } },
-          }
-        : {}),
     };
 
     const [rows, total] = await Promise.all([
@@ -210,32 +338,14 @@ export class InventoryService {
         skip,
         take,
         orderBy: [{ updatedAt: 'desc' }],
-        include: {
-          product: {
-            select: {
-              id: true,
-              name: true,
-              sku: true,
-              baseUnit: true,
-              reorderLevel: true,
-            },
-          },
-          location: { select: locationSelect },
-        },
+        include: balanceInclude,
       }),
       this.prisma.stockBalance.count({ where }),
     ]);
 
-    let items = rows.map((r) => this.mapBalance(r));
-    if (query.lowStockOnly) {
-      items = items.filter(
-        (r) => r.product.reorderLevel != null && r.quantity <= r.product.reorderLevel,
-      );
-    }
-
     return {
-      items,
-      meta: buildPaginationMeta(query.lowStockOnly ? items.length : total, page, limit),
+      items: rows.map((r) => this.mapBalance(r)),
+      meta: buildPaginationMeta(total, page, limit),
     };
   }
 
@@ -386,6 +496,113 @@ export class InventoryService {
     return this.mapMovement(movement);
   }
 
+  /**
+   * Transfer history: one row per transferGroupId (paired OUT + IN).
+   */
+  async listTransfers(tenantId: string, query: { page?: number; limit?: number }) {
+    await assertWarehouseEnabled(this.prisma, tenantId);
+
+    const page = Math.max(1, query.page ?? 1);
+    const limit = Math.min(100, Math.max(1, query.limit ?? 20));
+    const { skip, take } = getPaginationParams({ page, limit });
+
+    const where: Prisma.StockMovementWhereInput = {
+      tenantId,
+      type: StockMovementType.TRANSFER_OUT,
+      transferGroupId: { not: null },
+    };
+
+    const [outs, total] = await Promise.all([
+      this.prisma.stockMovement.findMany({
+        where,
+        skip,
+        take,
+        orderBy: { createdAt: 'desc' },
+        include: {
+          product: { select: { id: true, name: true, sku: true, baseUnit: true } },
+          location: { select: locationSelect },
+          createdBy: {
+            select: { id: true, firstName: true, lastName: true, email: true },
+          },
+        },
+      }),
+      this.prisma.stockMovement.count({ where }),
+    ]);
+
+    const groupIds = outs.map((o) => o.transferGroupId).filter((id): id is string => !!id);
+
+    const ins =
+      groupIds.length === 0
+        ? []
+        : await this.prisma.stockMovement.findMany({
+            where: {
+              tenantId,
+              type: StockMovementType.TRANSFER_IN,
+              transferGroupId: { in: groupIds },
+            },
+            include: {
+              location: { select: locationSelect },
+            },
+          });
+    const inByGroup = new Map(ins.map((m) => [m.transferGroupId!, m]));
+
+    const items = outs.map((out) => {
+      const inn = out.transferGroupId ? inByGroup.get(out.transferGroupId) : undefined;
+      return {
+        transferGroupId: out.transferGroupId!,
+        createdAt: out.createdAt,
+        quantity: Math.abs(decimalToNumber(out.quantity)),
+        product: out.product,
+        fromLocation: out.location,
+        toLocation: inn?.location ?? null,
+        createdBy: out.createdBy,
+      };
+    });
+
+    return {
+      items,
+      meta: buildPaginationMeta(total, page, limit),
+    };
+  }
+
+  async getTransfer(tenantId: string, transferGroupId: string) {
+    await assertWarehouseEnabled(this.prisma, tenantId);
+
+    const rows = await this.prisma.stockMovement.findMany({
+      where: { tenantId, transferGroupId },
+      include: {
+        product: { select: { id: true, name: true, sku: true, baseUnit: true } },
+        location: { select: locationSelect },
+        createdBy: {
+          select: { id: true, firstName: true, lastName: true, email: true },
+        },
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    if (rows.length === 0) {
+      throw new NotFoundException('Transfer not found');
+    }
+
+    const out = rows.find((r) => r.type === StockMovementType.TRANSFER_OUT);
+    const inn = rows.find((r) => r.type === StockMovementType.TRANSFER_IN);
+    if (!out || !inn) {
+      throw new NotFoundException('Transfer pair incomplete');
+    }
+
+    return {
+      transferGroupId,
+      createdAt: out.createdAt,
+      quantity: Math.abs(decimalToNumber(out.quantity)),
+      product: out.product,
+      fromLocation: out.location,
+      toLocation: inn.location,
+      createdBy: out.createdBy,
+      outMovementId: out.id,
+      inMovementId: inn.id,
+    };
+  }
+
   async postTransfer(tenantId: string, dto: PostTransferDto, actorId: string) {
     await assertWarehouseEnabled(this.prisma, tenantId);
 
@@ -512,49 +729,15 @@ export class InventoryService {
       actorId: string;
     },
   ) {
-    const balance = await tx.stockBalance.findUnique({
-      where: {
-        tenantId_locationId_productId: {
-          tenantId: args.tenantId,
-          locationId: args.locationId,
-          productId: args.productId,
-        },
-      },
-    });
-
-    const current = balance ? new Prisma.Decimal(balance.quantity) : new Prisma.Decimal(0);
-    const next = current.add(args.quantity);
-    if (next.lessThan(0)) {
-      throw new BadRequestException('Insufficient stock: resulting quantity would be negative');
-    }
-
-    if (balance) {
-      await tx.stockBalance.update({
-        where: { id: balance.id },
-        data: { quantity: next },
-      });
-    } else {
-      await tx.stockBalance.create({
-        data: {
-          tenantId: args.tenantId,
-          locationId: args.locationId,
-          productId: args.productId,
-          quantity: next,
-        },
-      });
-    }
-
-    return tx.stockMovement.create({
-      data: {
-        tenantId: args.tenantId,
-        locationId: args.locationId,
-        productId: args.productId,
-        type: args.type,
-        quantity: args.quantity,
-        reason: args.reason ?? null,
-        transferGroupId: args.transferGroupId ?? null,
-        createdByUserId: args.actorId,
-      },
+    return applyProductStockMovement(tx, {
+      tenantId: args.tenantId,
+      locationId: args.locationId,
+      productId: args.productId,
+      type: args.type,
+      quantity: args.quantity,
+      reason: args.reason,
+      transferGroupId: args.transferGroupId,
+      actorId: args.actorId,
     });
   }
 

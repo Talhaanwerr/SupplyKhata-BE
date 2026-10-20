@@ -83,6 +83,15 @@ export class CreateProductDto {
   containerCapacity?: number | null;
 
   @ApiPropertyOptional({
+    description: 'Shared packaging type. Required when returnable and containers flag is ON.',
+  })
+  @IsOptional()
+  @ValidateIf((_, v) => v != null && v !== '')
+  @IsString()
+  @MinLength(1)
+  packagingTypeId?: string | null;
+
+  @ApiPropertyOptional({
     example: false,
     description: 'Defaults true for LTR/KG, false for PCS when omitted',
   })

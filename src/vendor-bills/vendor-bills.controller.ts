@@ -1,4 +1,14 @@
-import { Body, Controller, Get, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Headers,
+  Param,
+  Patch,
+  Post,
+  Query,
+  UseGuards,
+} from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { TenantGuard } from '../common/guards/tenant.guard';
 import { PermissionsGuard } from '../common/guards/permissions.guard';
@@ -6,6 +16,8 @@ import { RequirePermissions } from '../common/decorators/permissions.decorator';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { CurrentTenant } from '../common/decorators/current-tenant.decorator';
 import { AuthenticatedUser } from '../auth/types/jwt-payload.type';
+import { PrismaService } from '../prisma/prisma.service';
+import { runIdempotent } from '../common/helpers/idempotency.helper';
 import { VendorBillsService } from './vendor-bills.service';
 import {
   CreateBillFromGoodsReceiptDto,
@@ -21,7 +33,10 @@ import {
 @UseGuards(JwtAuthGuard, TenantGuard, PermissionsGuard)
 @Controller({ path: 'vendor-bills', version: '1' })
 export class VendorBillsController {
-  constructor(private readonly vendorBillsService: VendorBillsService) {}
+  constructor(
+    private readonly vendorBillsService: VendorBillsService,
+    private readonly prisma: PrismaService,
+  ) {}
 
   @Get()
   @RequirePermissions('vendor-bills:read')
@@ -33,6 +48,24 @@ export class VendorBillsController {
   @RequirePermissions('vendor-bills:read')
   listDues(@Query() query: ListVendorDuesQueryDto, @CurrentTenant() tenantId: string) {
     return this.vendorBillsService.listDues(tenantId, query);
+  }
+
+  @Get('schedule')
+  @RequirePermissions('vendor-bills:read')
+  listSchedule(
+    @Query('daysAhead') daysAhead: string | undefined,
+    @CurrentTenant() tenantId: string,
+  ) {
+    const n = daysAhead != null && daysAhead !== '' ? Number(daysAhead) : undefined;
+    return this.vendorBillsService.listSchedule(tenantId, {
+      daysAhead: Number.isFinite(n) ? n : undefined,
+    });
+  }
+
+  @Post('dues/notify')
+  @RequirePermissions('vendor-bills:read')
+  notifyOverduePayables(@CurrentTenant() tenantId: string, @CurrentUser() user: AuthenticatedUser) {
+    return this.vendorBillsService.notifyOverduePayables(tenantId, user.id);
   }
 
   @Get('ledger/:vendorId')
@@ -86,8 +119,13 @@ export class VendorBillsController {
     @Body() dto: PayVendorBillDto,
     @CurrentTenant() tenantId: string,
     @CurrentUser() user: AuthenticatedUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.vendorBillsService.pay(id, tenantId, dto, user.id);
+    return runIdempotent(
+      this.prisma,
+      { tenantId, scope: 'vendor-bills:pay', key: idempotencyKey },
+      () => this.vendorBillsService.pay(id, tenantId, dto, user.id),
+    );
   }
 
   @Post(':id/void')

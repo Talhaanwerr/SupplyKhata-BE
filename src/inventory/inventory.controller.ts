@@ -65,6 +65,24 @@ export class InventoryController {
     return this.inventoryService.listMovements(tenantId, query);
   }
 
+  @Get('transfers')
+  @RequirePermissions('inventory:read')
+  listTransfers(@Query() query: ListMovementsQueryDto, @CurrentTenant() tenantId: string) {
+    return this.inventoryService.listTransfers(tenantId, {
+      page: query.page,
+      limit: query.limit,
+    });
+  }
+
+  @Get('transfers/:transferGroupId')
+  @RequirePermissions('inventory:read')
+  getTransfer(
+    @Param('transferGroupId') transferGroupId: string,
+    @CurrentTenant() tenantId: string,
+  ) {
+    return this.inventoryService.getTransfer(tenantId, transferGroupId);
+  }
+
   @Post('opening')
   @RequirePermissions('inventory:create')
   postOpening(
@@ -93,5 +111,11 @@ export class InventoryController {
     @CurrentUser() user: AuthenticatedUser,
   ) {
     return this.inventoryService.postTransfer(tenantId, dto, user.id);
+  }
+
+  @Post('alerts/notify')
+  @RequirePermissions('inventory:read')
+  notifyLowStockAlerts(@CurrentTenant() tenantId: string, @CurrentUser() user: AuthenticatedUser) {
+    return this.inventoryService.notifyLowStockAlerts(tenantId, user.id);
   }
 }

@@ -12,6 +12,7 @@ import {
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { DeliveryRunStockDto } from './delivery-run-stock.dto';
+import { DeliveryRunPackagingStockDto } from './delivery-run-packaging-stock.dto';
 
 export class UpdateDeliveryRunDto {
   @ApiPropertyOptional({ example: 50 })
@@ -29,6 +30,14 @@ export class UpdateDeliveryRunDto {
   @ValidateNested({ each: true })
   @Type(() => DeliveryRunStockDto)
   openingStock?: DeliveryRunStockDto[];
+
+  @ApiPropertyOptional({ type: [DeliveryRunPackagingStockDto] })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(100)
+  @ValidateNested({ each: true })
+  @Type(() => DeliveryRunPackagingStockDto)
+  openingPackagingStock?: DeliveryRunPackagingStockDto[];
 
   @ApiPropertyOptional()
   @IsOptional()

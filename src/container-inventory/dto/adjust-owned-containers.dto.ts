@@ -1,17 +1,44 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
-import { IsInt, IsOptional, IsString, MaxLength, MinLength, ValidateIf } from 'class-validator';
+import {
+  IsEnum,
+  IsInt,
+  IsOptional,
+  IsString,
+  MaxLength,
+  MinLength,
+  ValidateIf,
+} from 'class-validator';
+import { ContainerMovementType } from '../../common/enums/delivery.enum';
+
+const WRITE_OFF_TYPES = [
+  ContainerMovementType.ADJUSTMENT,
+  ContainerMovementType.LOST,
+  ContainerMovementType.DAMAGED,
+] as const;
 
 export class AdjustOwnedContainersDto {
-  @ApiProperty()
+  @ApiProperty({ description: 'Shared packaging type (e.g. 20L Can)' })
   @IsString()
   @MinLength(1)
-  productId!: string;
+  packagingTypeId!: string;
 
-  @ApiProperty({ example: 5, description: 'Signed delta for owned fleet; non-zero' })
+  @ApiProperty({
+    example: 5,
+    description:
+      'For ADJUSTMENT: signed delta. For LOST/DAMAGED: positive cans removed from owned fleet.',
+  })
   @Type(() => Number)
   @IsInt()
   quantityDelta!: number;
+
+  @ApiPropertyOptional({
+    enum: WRITE_OFF_TYPES,
+    default: ContainerMovementType.ADJUSTMENT,
+  })
+  @IsOptional()
+  @IsEnum(ContainerMovementType)
+  movementType?: (typeof WRITE_OFF_TYPES)[number];
 
   @ApiPropertyOptional()
   @IsOptional()

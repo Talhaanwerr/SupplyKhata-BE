@@ -3,6 +3,8 @@ import { PlannedStopSource, PlannedStopStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditLogsService } from '../audit-logs/audit-logs.service';
 import { assertValidBaseQuantity, decimalQtyToNumber } from '../common/helpers/product-qty.helper';
+import { assertOrdersEnabled } from '../common/helpers/orders.helper';
+import { isRiderOnlyUser } from '../common/helpers/rider-scope.helper';
 import {
   addDays,
   endOfDay,
@@ -10,6 +12,7 @@ import {
   startOfDay,
   todayStart,
 } from '../common/helpers/calendar-date.helper';
+import { OrdersService } from '../orders/orders.service';
 import { UpsertDeliveryScheduleDto } from './dto/upsert-delivery-schedule.dto';
 import {
   CreateManualPlannedStopDto,
@@ -28,6 +31,7 @@ export class SchedulingService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditLogsService,
+    private readonly orders: OrdersService,
   ) {}
 
   // ─── Schedule CRUD ─────────────────────────────────────────
@@ -179,7 +183,7 @@ export class SchedulingService {
 
   // ─── Daily list ────────────────────────────────────────────
 
-  async listPlannedStops(tenantId: string, query: ListPlannedStopsQueryDto) {
+  async listPlannedStops(tenantId: string, query: ListPlannedStopsQueryDto, actorId: string) {
     const day = parseCalendarDate(query.date);
     const dayEnd = endOfDay(day);
 
@@ -190,16 +194,26 @@ export class SchedulingService {
       planDate: { gte: day, lte: dayEnd },
     };
     if (query.status) where.status = query.status;
-    if (query.areaId || query.search || query.riderId) {
-      where.customer = {
-        ...(query.areaId ? { areaId: query.areaId } : {}),
-        ...(query.riderId ? { defaultRiderId: query.riderId } : {}),
-        ...(query.search
-          ? {
-              OR: [{ name: { contains: query.search } }, { phone: { contains: query.search } }],
-            }
-          : {}),
-      };
+
+    const riderOnly = await isRiderOnlyUser(this.prisma, tenantId, actorId);
+    const customerAnd: Prisma.CustomerWhereInput[] = [];
+    if (query.areaId) customerAnd.push({ areaId: query.areaId });
+    if (query.search?.trim()) {
+      const q = query.search.trim();
+      customerAnd.push({
+        OR: [{ name: { contains: q } }, { phone: { contains: q } }],
+      });
+    }
+    if (riderOnly) {
+      // Pure riders: own assigned customers + unassigned. Ignore client riderId.
+      customerAnd.push({
+        OR: [{ defaultRiderId: actorId }, { defaultRiderId: null }],
+      });
+    } else if (query.riderId) {
+      customerAnd.push({ defaultRiderId: query.riderId });
+    }
+    if (customerAnd.length > 0) {
+      where.customer = { AND: customerAnd };
     }
 
     const stops = await this.prisma.plannedDeliveryStop.findMany({
@@ -321,6 +335,141 @@ export class SchedulingService {
   }
 
   /**
+   * Convert PLANNED / INCLUDED (undelivered) stop → CustomerOrder DRAFT.
+   * Stop becomes CANCELLED with skipReason noting the order number (not deliverable).
+   * Schedule cadence advances like skip (planDate + intervalDays).
+   * Does NOT place the order — no ORDER_SALE / stock until user Places in Orders UI.
+   */
+  async convertToOrder(id: string, tenantId: string, actorId: string) {
+    await assertOrdersEnabled(this.prisma, tenantId);
+
+    const stop = await this.prisma.plannedDeliveryStop.findFirst({
+      where: { id, tenantId },
+      include: {
+        items: true,
+        customer: { select: { id: true, status: true, deletedAt: true } },
+      },
+    });
+    if (!stop) throw new NotFoundException('Planned stop not found');
+
+    if (stop.status !== PlannedStopStatus.PLANNED && stop.status !== PlannedStopStatus.INCLUDED) {
+      throw new BadRequestException(`Cannot convert a ${stop.status} stop to an order`);
+    }
+    if (stop.deliveryId) {
+      throw new BadRequestException('Stop already has a delivery — cannot convert to order');
+    }
+    if (stop.customer.deletedAt != null || stop.customer.status !== 'ACTIVE') {
+      throw new BadRequestException('Customer must be ACTIVE to create an order');
+    }
+
+    const items = stop.items
+      .map((i) => ({
+        productId: i.productId,
+        quantity: decimalQtyToNumber(i.plannedQuantity),
+      }))
+      .filter((i) => i.quantity > 0);
+    if (items.length === 0) {
+      throw new BadRequestException('Stop has no product quantities to convert');
+    }
+
+    const planDate = stop.planDate.toISOString().slice(0, 10);
+    const previousStatus = stop.status;
+    const previousRunId = stop.deliveryRunId;
+
+    // Claim stop first (conditional) so concurrent convert / include / deliver cannot double-sell.
+    const claimed = await this.prisma.plannedDeliveryStop.updateMany({
+      where: {
+        id,
+        tenantId,
+        deliveryId: null,
+        status: { in: [PlannedStopStatus.PLANNED, PlannedStopStatus.INCLUDED] },
+      },
+      data: {
+        status: PlannedStopStatus.CANCELLED,
+        skipReason: 'Converting to order…',
+        deliveryRunId: null,
+      },
+    });
+    if (claimed.count === 0) {
+      throw new BadRequestException('Stop is no longer convertible (already used or cancelled)');
+    }
+
+    let order: Awaited<ReturnType<OrdersService['create']>>;
+    try {
+      order = await this.orders.create(
+        tenantId,
+        {
+          customerId: stop.customerId,
+          items,
+          discountTotal: 0,
+          deliveryCharges: 0,
+          shippingNotes: `From planned stop ${stop.id} (${planDate})`,
+        },
+        actorId,
+      );
+    } catch (err) {
+      // Restore stop so office can retry / deliver if draft create failed.
+      await this.prisma.plannedDeliveryStop.update({
+        where: { id },
+        data: {
+          status: previousStatus,
+          skipReason: null,
+          deliveryRunId: previousRunId,
+        },
+      });
+      throw err;
+    }
+
+    const reason = `Converted to order #${order.orderNumber}`;
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.plannedDeliveryStop.update({
+        where: { id },
+        data: { skipReason: reason },
+      });
+
+      // Same cadence as skip: next stop from original planDate + intervalDays
+      if (stop.source === PlannedStopSource.SCHEDULE && stop.scheduleId) {
+        const schedule = await tx.customerDeliverySchedule.findFirst({
+          where: { id: stop.scheduleId, tenantId, isActive: true },
+          include: { items: true },
+        });
+        if (schedule) {
+          const nextDate = addDays(startOfDay(stop.planDate), schedule.intervalDays);
+          await this.createStopIfNoUpcoming(tx, {
+            tenantId,
+            customerId: stop.customerId,
+            scheduleId: schedule.id,
+            planDate: nextDate,
+            items: schedule.items.map((i) => ({
+              productId: i.productId,
+              plannedQuantity: decimalQtyToNumber(i.defaultQuantity),
+            })),
+          });
+        }
+      }
+    });
+
+    await this.audit.write({
+      tenantId,
+      actorId,
+      module: 'planned-stops',
+      action: 'CONVERT_TO_ORDER',
+      entityId: id,
+      newValue: {
+        orderId: order.id,
+        orderNumber: order.orderNumber,
+        previousStatus,
+      },
+    });
+
+    return {
+      order,
+      plannedStop: await this.findStopDetail(id, tenantId),
+    };
+  }
+
+  /**
    * SKIPPED/FAILED: advance cadence from original planDate + intervalDays
    * so the schedule does not die (Phase 2 rule).
    */
@@ -393,6 +542,10 @@ export class SchedulingService {
       where: { id: runId, tenantId },
     });
     if (!run) throw new NotFoundException('Delivery run not found');
+    const riderOnly = await isRiderOnlyUser(this.prisma, tenantId, actorId);
+    if (riderOnly && run.riderId !== actorId) {
+      throw new NotFoundException('Delivery run not found');
+    }
     if (run.status !== 'OPEN') {
       throw new BadRequestException('Can only include planned stops into an OPEN run');
     }
@@ -406,6 +559,9 @@ export class SchedulingService {
         id: { in: dto.plannedStopIds },
         status: PlannedStopStatus.PLANNED,
       },
+      include: {
+        customer: { select: { id: true, defaultRiderId: true, name: true } },
+      },
     });
     if (stops.length !== dto.plannedStopIds.length) {
       throw new BadRequestException('One or more stops are missing or not PLANNED');
@@ -413,6 +569,17 @@ export class SchedulingService {
     for (const stop of stops) {
       if (stop.planDate < runDay || stop.planDate > runDayEnd) {
         throw new BadRequestException('Planned stop date must match the delivery run date');
+      }
+    }
+
+    if (riderOnly) {
+      for (const stop of stops) {
+        const assigned = stop.customer.defaultRiderId;
+        if (assigned != null && assigned !== actorId) {
+          throw new BadRequestException(
+            `Cannot include "${stop.customer.name}" — assigned to another rider`,
+          );
+        }
       }
     }
 
@@ -751,6 +918,7 @@ export class SchedulingService {
           areaId: true,
           area: { select: { id: true, name: true } },
           defaultRiderId: true,
+          defaultRider: { select: { id: true, firstName: true, lastName: true } },
         },
       },
       items: {
@@ -797,6 +965,7 @@ export class SchedulingService {
       include: ReturnType<SchedulingService['stopInclude']>;
     }>,
   ) {
+    const rider = stop.customer.defaultRider;
     return {
       id: stop.id,
       planDate: stop.planDate.toISOString().slice(0, 10),
@@ -805,6 +974,8 @@ export class SchedulingService {
       customerPhone: stop.customer.phone,
       areaId: stop.customer.areaId,
       areaName: stop.customer.area?.name ?? null,
+      defaultRiderId: stop.customer.defaultRiderId,
+      defaultRiderName: rider ? `${rider.firstName} ${rider.lastName}`.trim() || null : null,
       scheduleId: stop.scheduleId,
       intervalDays: stop.schedule?.intervalDays ?? null,
       deliveryRunId: stop.deliveryRunId,

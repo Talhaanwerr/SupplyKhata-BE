@@ -32,7 +32,7 @@ function decimalToNumber(value: DecimalLike): number {
 }
 
 function parseDate(value: string): Date {
-  const parsed = new Date(value);
+  const parsed = parseCalendarDateUtc(value, false);
   if (Number.isNaN(parsed.getTime())) {
     throw new BadRequestException('Invalid date');
   }

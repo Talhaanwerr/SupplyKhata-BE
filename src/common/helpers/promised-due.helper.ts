@@ -18,10 +18,15 @@ function startOfDay(d: Date): Date {
 
 type DbClient = Prisma.TransactionClient | PrismaService;
 
+/** Links a Payment row to the delivery stop that collected the cash. */
+export function deliveryPaymentReference(deliveryId: string): string {
+  return `delivery:${deliveryId}`;
+}
+
 /**
  * Cash that counts toward settling a rider payment promise:
- * - standalone Payment rows (paymentDate)
- * - delivery cash ledger PAYMENT rows (delivery.deliveryDate), excluding cancelled
+ * - Payment rows (standalone + on-stop cash mirrored into payments)
+ * - legacy delivery ledger PAYMENT rows that have no matching Payment yet
  */
 async function paidTowardPromiseSince(
   db: DbClient,
@@ -61,20 +66,38 @@ async function paidTowardPromiseSince(
   ];
   if (deliveryIds.length === 0) return total;
 
-  const qualifyingDeliveries = await db.delivery.findMany({
-    where: {
-      tenantId,
-      customerId,
-      id: { in: deliveryIds },
-      deliveryDate: { gte: dueDay },
-      status: { not: PrismaDeliveryStatus.CANCELLED },
-    },
-    select: { id: true },
-  });
+  const [qualifyingDeliveries, linkedPayments] = await Promise.all([
+    db.delivery.findMany({
+      where: {
+        tenantId,
+        customerId,
+        id: { in: deliveryIds },
+        deliveryDate: { gte: dueDay },
+        status: { not: PrismaDeliveryStatus.CANCELLED },
+      },
+      select: { id: true },
+    }),
+    db.payment.findMany({
+      where: {
+        tenantId,
+        customerId,
+        reference: { in: deliveryIds.map((id) => deliveryPaymentReference(id)) },
+      },
+      select: { reference: true },
+    }),
+  ]);
   const qualifying = new Set(qualifyingDeliveries.map((d) => d.id));
+  const alreadyInPayments = new Set(
+    linkedPayments
+      .map((p) => p.reference)
+      .filter((ref): ref is string => !!ref)
+      .map((ref) => ref.replace(/^delivery:/, '')),
+  );
 
   for (const row of deliveryCashEntries) {
     if (!row.referenceId || !qualifying.has(row.referenceId)) continue;
+    // Already counted via the Payment row created for this stop.
+    if (alreadyInPayments.has(row.referenceId)) continue;
     // Ledger PAYMENT amounts are stored negative (credit).
     total += Math.abs(decimalToNumber(row.amount));
   }

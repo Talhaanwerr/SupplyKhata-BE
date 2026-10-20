@@ -6,6 +6,7 @@ import { FilesService } from '../files/files.service';
 import { FileVisibility } from '../files/dto/list-files-query.dto';
 import { UpdateSettingsDto } from './dto/update-settings.dto';
 import {
+  getFeatureDisabledSidebarKeys,
   normalizeSidebarNavInput,
   parseSidebarNav,
   type SidebarNavPrefs,
@@ -39,23 +40,26 @@ function normalizeDomains(domains: string[] | undefined): string[] | undefined {
   return cleaned;
 }
 
-function mapSettings(row: {
-  id: string;
-  tenantId: string;
-  orgName: string | null;
-  logo: string | null;
-  phone: string | null;
-  address: string | null;
-  timezone: string;
-  currency: string;
-  dateFormat: string;
-  invoicePrefix: string;
-  themeColor: string;
-  allowedDomains: Prisma.JsonValue;
-  sidebarNav: Prisma.JsonValue;
-  createdAt: Date;
-  updatedAt: Date;
-}): TenantSettings {
+function mapSettings(
+  row: {
+    id: string;
+    tenantId: string;
+    orgName: string | null;
+    logo: string | null;
+    phone: string | null;
+    address: string | null;
+    timezone: string;
+    currency: string;
+    dateFormat: string;
+    invoicePrefix: string;
+    themeColor: string;
+    allowedDomains: Prisma.JsonValue;
+    sidebarNav: Prisma.JsonValue;
+    createdAt: Date;
+    updatedAt: Date;
+  },
+  disabledSidebarKeys?: Set<string>,
+): TenantSettings {
   const raw = row.allowedDomains;
   const allowedDomains = Array.isArray(raw)
     ? raw.filter((d): d is string => typeof d === 'string')
@@ -63,7 +67,7 @@ function mapSettings(row: {
   return {
     ...row,
     allowedDomains,
-    sidebarNav: parseSidebarNav(row.sidebarNav),
+    sidebarNav: parseSidebarNav(row.sidebarNav, disabledSidebarKeys),
   };
 }
 
@@ -76,28 +80,35 @@ export class SettingsService {
   ) {}
 
   async getSidebarNav(tenantId: string): Promise<SidebarNavPrefs> {
-    const settings = await this.prisma.tenantSettings.upsert({
-      where: { tenantId },
-      update: {},
-      create: { tenantId },
-      select: { sidebarNav: true },
-    });
-    return parseSidebarNav(settings.sidebarNav);
+    const [settings, disabledKeys] = await Promise.all([
+      this.prisma.tenantSettings.upsert({
+        where: { tenantId },
+        update: {},
+        create: { tenantId },
+        select: { sidebarNav: true },
+      }),
+      getFeatureDisabledSidebarKeys(this.prisma, tenantId),
+    ]);
+    return parseSidebarNav(settings.sidebarNav, disabledKeys);
   }
 
   async get(tenantId: string): Promise<TenantSettings> {
-    const settings = await this.prisma.tenantSettings.upsert({
-      where: { tenantId },
-      update: {},
-      create: { tenantId },
-    });
-    return mapSettings(settings);
+    const [settings, disabledKeys] = await Promise.all([
+      this.prisma.tenantSettings.upsert({
+        where: { tenantId },
+        update: {},
+        create: { tenantId },
+      }),
+      getFeatureDisabledSidebarKeys(this.prisma, tenantId),
+    ]);
+    return mapSettings(settings, disabledKeys);
   }
 
   async update(tenantId: string, dto: UpdateSettingsDto, actorId: string): Promise<TenantSettings> {
     const old = await this.get(tenantId);
     const domains = normalizeDomains(dto.allowedDomains);
-    const sidebarNav = normalizeSidebarNavInput(dto.sidebarNavMore);
+    const disabledKeys = await getFeatureDisabledSidebarKeys(this.prisma, tenantId);
+    const sidebarNav = normalizeSidebarNavInput(dto.sidebarNavMore, disabledKeys);
 
     const data: Prisma.TenantSettingsUpdateInput = {};
     if (dto.orgName !== undefined) data.orgName = dto.orgName;
@@ -154,7 +165,7 @@ export class SettingsService {
       newValue: dto as unknown as Record<string, unknown>,
     });
 
-    return mapSettings(updated);
+    return mapSettings(updated, disabledKeys);
   }
 
   async uploadLogo(

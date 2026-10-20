@@ -11,14 +11,19 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditLogsService } from '../audit-logs/audit-logs.service';
 import { getPaginationParams, buildPaginationMeta } from '../common/helpers/pagination.helper';
-import { clearPromisedDueIfSettled } from '../common/helpers/promised-due.helper';
+import {
+  clearPromisedDueIfSettled,
+  deliveryPaymentReference,
+} from '../common/helpers/promised-due.helper';
 import {
   assertNoEmptiesWhenContainersDisabled,
+  assertProductPackaging,
   isReturnableContainersEnabled,
   packagingUnitsOutForDelivery,
   RETURNABLE_CONTAINERS_DISABLED_MESSAGE,
 } from '../common/helpers/returnable-containers.helper';
 import { assertValidBaseQuantity, decimalQtyToNumber } from '../common/helpers/product-qty.helper';
+import { isRiderOnlyUser } from '../common/helpers/rider-scope.helper';
 import { PaginatedData } from '../common/types/api-response.type';
 import { DeliveryStatus } from '../common/enums/delivery.enum';
 import { CreateDeliveryDto } from './dto/create-delivery.dto';
@@ -58,7 +63,8 @@ export class DeliveriesService {
   ) {}
 
   async create(tenantId: string, dto: CreateDeliveryDto, actorId: string) {
-    this.assertItems(dto.items);
+    const cashReceived = dto.cashReceived ?? 0;
+    this.assertItems(dto.items, cashReceived);
     const deliveryDate = parseDate(dto.deliveryDate);
     const costAsOf = parseCalendarDateUtc(dto.deliveryDate, true);
 
@@ -84,7 +90,7 @@ export class DeliveriesService {
     const [run, customer, products, prices, costRows, containersEnabled] = await Promise.all([
       this.prisma.deliveryRun.findFirst({
         where: { id: dto.deliveryRunId, tenantId },
-        select: { id: true, status: true, vehicleId: true },
+        select: { id: true, status: true, vehicleId: true, riderId: true },
       }),
       this.prisma.customer.findFirst({
         where: { id: dto.customerId, tenantId, deletedAt: null, status: 'ACTIVE' },
@@ -100,6 +106,7 @@ export class DeliveriesService {
           baseUnit: true,
           allowFractionalQty: true,
           containerCapacity: true,
+          packagingTypeId: true,
         },
       }),
       this.prisma.customerProductPrice.findMany({
@@ -124,6 +131,11 @@ export class DeliveriesService {
     if (run.status !== PrismaRunStatus.OPEN) {
       throw new BadRequestException('Cannot add delivery to a closed run');
     }
+    if (await isRiderOnlyUser(this.prisma, tenantId, actorId)) {
+      if (run.riderId !== actorId) {
+        throw new BadRequestException('You can only deliver on your own run');
+      }
+    }
     if (!customer) throw new BadRequestException('Customer not found in this workspace');
     if (products.length !== new Set(productIds).size) {
       throw new BadRequestException('One or more products are invalid for this workspace');
@@ -138,6 +150,7 @@ export class DeliveriesService {
 
     const resolvedItems: Array<{
       productId: string;
+      packagingTypeId: string | null;
       quantityDelivered: number;
       emptiesReceived: number;
       containersDelivered: number;
@@ -159,6 +172,7 @@ export class DeliveriesService {
       assertValidBaseQuantity(item.quantityDelivered, product);
 
       const trackContainers = containersEnabled && product.isReturnable;
+      const packagingTypeId = trackContainers ? assertProductPackaging(product) : null;
       const rawEmpties = item.emptiesReceived ?? 0;
       if (!trackContainers && rawEmpties > 0) {
         throw new BadRequestException(
@@ -182,6 +196,7 @@ export class DeliveriesService {
         : 0;
       resolvedItems.push({
         productId: item.productId,
+        packagingTypeId,
         quantityDelivered: item.quantityDelivered,
         emptiesReceived: trackContainers ? rawEmpties : 0,
         containersDelivered: packagingUnitsOut,
@@ -193,22 +208,22 @@ export class DeliveriesService {
       });
     }
 
-    if (resolvedItems.length === 0) {
-      throw new BadRequestException('At least one delivered or returned container is required');
+    if (resolvedItems.length === 0 && cashReceived <= 0) {
+      throw new BadRequestException('Enter delivered qty, empties, or cash received for this stop');
     }
 
     const totalSales = resolvedItems.reduce(
       (sum, item) => sum.plus(item.lineTotal),
       new Prisma.Decimal(0),
     );
-    const cashReceived = dto.cashReceived ?? 0;
+    const paymentMethod = (dto.paymentMethod ?? PrismaPaymentMethod.CASH) as PrismaPaymentMethod;
 
     const deliveryId = await this.prisma.$transaction(
       async (tx) => {
         // Re-check run status inside tx so concurrent close cannot race.
         const openRun = await tx.deliveryRun.findFirst({
           where: { id: dto.deliveryRunId, tenantId, status: PrismaRunStatus.OPEN },
-          select: { id: true, vehicleId: true },
+          select: { id: true, vehicleId: true, riderId: true },
         });
         if (!openRun) {
           throw new BadRequestException('Cannot add delivery to a closed run');
@@ -228,7 +243,7 @@ export class DeliveriesService {
             deliveryRunId: dto.deliveryRunId,
             customerId: dto.customerId,
             deliveryDate,
-            paymentMethod: (dto.paymentMethod ?? PrismaPaymentMethod.CASH) as PrismaPaymentMethod,
+            paymentMethod,
             cashReceived,
             status: PrismaDeliveryStatus.DELIVERED,
             notes: dto.notes?.trim() || null,
@@ -259,17 +274,22 @@ export class DeliveriesService {
         const trackByProduct = new Map(
           resolvedItems.map((item) => [
             item.productId,
-            { track: item.trackContainers, packagingUnitsOut: item.packagingUnitsOut },
+            {
+              track: item.trackContainers,
+              packagingUnitsOut: item.packagingUnitsOut,
+              packagingTypeId: item.packagingTypeId,
+            },
           ]),
         );
         for (const createdItem of created.items) {
           const flags = trackByProduct.get(createdItem.productId);
-          if (!flags?.track) continue;
+          if (!flags?.track || !flags.packagingTypeId) continue;
 
           if (flags.packagingUnitsOut > 0) {
             movements.push({
               tenantId,
               productId: createdItem.productId,
+              packagingTypeId: flags.packagingTypeId,
               deliveryItemId: createdItem.id,
               customerId: dto.customerId,
               vehicleId: openRun.vehicleId,
@@ -282,6 +302,7 @@ export class DeliveriesService {
             movements.push({
               tenantId,
               productId: createdItem.productId,
+              packagingTypeId: flags.packagingTypeId,
               deliveryItemId: createdItem.id,
               customerId: dto.customerId,
               vehicleId: openRun.vehicleId,
@@ -295,8 +316,9 @@ export class DeliveriesService {
           await tx.containerMovement.createMany({ data: movements });
         }
 
-        const ledgerEntries: Prisma.CustomerLedgerEntryCreateManyInput[] = [
-          {
+        const ledgerEntries: Prisma.CustomerLedgerEntryCreateManyInput[] = [];
+        if (totalSales.gt(0)) {
+          ledgerEntries.push({
             tenantId,
             customerId: dto.customerId,
             entryType: PrismaLedgerEntryType.DELIVERY_SALE,
@@ -304,9 +326,22 @@ export class DeliveriesService {
             referenceId: created.id,
             referenceType: 'delivery',
             notes: 'Delivery sale',
-          },
-        ];
+          });
+        }
         if (cashReceived > 0) {
+          // Mirror into Payment so cycle overdue / lastPaymentDate see on-stop cash.
+          await tx.payment.create({
+            data: {
+              tenantId,
+              customerId: dto.customerId,
+              amount: cashReceived,
+              paymentDate: deliveryDate,
+              method: paymentMethod,
+              collectedById: openRun.riderId,
+              reference: deliveryPaymentReference(created.id),
+              notes: 'Delivery cash received',
+            },
+          });
           ledgerEntries.push({
             tenantId,
             customerId: dto.customerId,
@@ -317,7 +352,9 @@ export class DeliveriesService {
             notes: 'Delivery cash received',
           });
         }
-        await tx.customerLedgerEntry.createMany({ data: ledgerEntries });
+        if (ledgerEntries.length > 0) {
+          await tx.customerLedgerEntry.createMany({ data: ledgerEntries });
+        }
 
         await tx.deliveryRun.update({
           where: { id: dto.deliveryRunId },
@@ -478,11 +515,12 @@ export class DeliveriesService {
             data: movements.map((movement) => ({
               tenantId,
               productId: movement.productId,
+              packagingTypeId: movement.packagingTypeId,
               deliveryItemId: movement.deliveryItemId,
               customerId: movement.customerId,
               vehicleId: movement.vehicleId,
-              // Keep productId required; use ADJUSTMENT with negated qty so empties
-              // RETURNS are not flipped into false DELIVERED_TO_CUSTOMER rows.
+              // Use ADJUSTMENT with negated qty so empties RETURNS are not flipped
+              // into false DELIVERED_TO_CUSTOMER rows.
               movementType: PrismaContainerMovementType.ADJUSTMENT,
               quantity: -movement.quantity,
               notes: 'Cancel reversal',
@@ -521,6 +559,15 @@ export class DeliveriesService {
           });
         }
 
+        // Remove mirrored Payment so overdue / lastPaymentDate no longer count this stop.
+        await tx.payment.deleteMany({
+          where: {
+            tenantId,
+            customerId: delivery.customerId,
+            reference: deliveryPaymentReference(id),
+          },
+        });
+
         await this.scheduling.revertStopOnDeliveryCancelInTx(tx, {
           tenantId,
           deliveryId: id,
@@ -548,13 +595,16 @@ export class DeliveriesService {
     return this.toDetail(cancelled);
   }
 
-  private assertItems(items: CreateDeliveryDto['items']): void {
+  private assertItems(items: CreateDeliveryDto['items'], cashReceived: number): void {
     const ids = items.map((item) => item.productId);
     if (new Set(ids).size !== ids.length) {
       throw new BadRequestException('Each product can appear only once per delivery');
     }
-    if (items.every((item) => item.quantityDelivered === 0 && (item.emptiesReceived ?? 0) === 0)) {
-      throw new BadRequestException('At least one delivered or returned container is required');
+    const hasProductActivity = items.some(
+      (item) => item.quantityDelivered > 0 || (item.emptiesReceived ?? 0) > 0,
+    );
+    if (!hasProductActivity && cashReceived <= 0) {
+      throw new BadRequestException('Enter delivered qty, empties, or cash received for this stop');
     }
   }
 
@@ -564,10 +614,11 @@ export class DeliveriesService {
     deliveryRunId: string,
     items: Array<{
       productId: string;
+      packagingTypeId: string | null;
       quantityDelivered: number;
       packagingUnitsOut: number;
     }>,
-    productMap: Map<string, { id: string; name: string }>,
+    productMap: Map<string, { id: string; name: string; packagingTypeId?: string | null }>,
   ): Promise<void> {
     const deliverItems = items.filter(
       (item) => item.quantityDelivered > 0 || item.packagingUnitsOut > 0,
@@ -575,7 +626,7 @@ export class DeliveriesService {
     if (deliverItems.length === 0) return;
 
     const productIds = deliverItems.map((item) => item.productId);
-    const [openingStocks, priorDeliveries] = await Promise.all([
+    const [openingStocks, packagingOpening, priorDeliveries] = await Promise.all([
       tx.deliveryRunStock.findMany({
         where: {
           tenantId,
@@ -585,6 +636,14 @@ export class DeliveriesService {
         },
         select: { productId: true, filledCount: true, filledPackagingCount: true },
       }),
+      tx.deliveryRunPackagingStock.findMany({
+        where: {
+          tenantId,
+          deliveryRunId,
+          stockType: PrismaStockType.OPENING,
+        },
+        select: { packagingTypeId: true, filledCount: true },
+      }),
       tx.delivery.findMany({
         where: {
           tenantId,
@@ -593,25 +652,30 @@ export class DeliveriesService {
         },
         select: {
           items: {
-            where: { productId: { in: productIds } },
             select: {
               productId: true,
               quantityDelivered: true,
               containersDelivered: true,
+              product: { select: { packagingTypeId: true } },
             },
           },
         },
       }),
     ]);
 
+    const packagingMode = packagingOpening.length > 0;
     const openingFilled = new Map(
       openingStocks.map((row) => [row.productId, decimalQtyToNumber(row.filledCount)]),
     );
     const openingCans = new Map(
       openingStocks.map((row) => [row.productId, row.filledPackagingCount]),
     );
+    const openingCansByType = new Map(
+      packagingOpening.map((row) => [row.packagingTypeId, row.filledCount]),
+    );
     const alreadyDelivered = new Map<string, number>();
     const alreadyCans = new Map<string, number>();
+    const alreadyCansByType = new Map<string, number>();
     for (const delivery of priorDeliveries) {
       for (const item of delivery.items) {
         alreadyDelivered.set(
@@ -622,11 +686,19 @@ export class DeliveriesService {
           item.productId,
           (alreadyCans.get(item.productId) ?? 0) + item.containersDelivered,
         );
+        const typeId = item.product.packagingTypeId;
+        if (typeId && item.containersDelivered > 0) {
+          alreadyCansByType.set(
+            typeId,
+            (alreadyCansByType.get(typeId) ?? 0) + item.containersDelivered,
+          );
+        }
       }
     }
 
     const requestedQty = new Map<string, number>();
     const requestedCans = new Map<string, number>();
+    const requestedCansByType = new Map<string, number>();
     for (const item of deliverItems) {
       requestedQty.set(
         item.productId,
@@ -636,6 +708,12 @@ export class DeliveriesService {
         item.productId,
         (requestedCans.get(item.productId) ?? 0) + item.packagingUnitsOut,
       );
+      if (item.packagingTypeId && item.packagingUnitsOut > 0) {
+        requestedCansByType.set(
+          item.packagingTypeId,
+          (requestedCansByType.get(item.packagingTypeId) ?? 0) + item.packagingUnitsOut,
+        );
+      }
     }
 
     for (const [productId, qty] of requestedQty) {
@@ -650,16 +728,30 @@ export class DeliveriesService {
       }
     }
 
-    for (const [productId, cans] of requestedCans) {
-      if (cans <= 0) continue;
-      const opening = openingCans.get(productId) ?? 0;
-      const used = alreadyCans.get(productId) ?? 0;
-      const available = opening - used;
-      if (cans > available) {
-        const name = productMap.get(productId)?.name ?? 'product';
-        throw new BadRequestException(
-          `Only ${available} filled cans left on this run for "${name}" (opening ${opening}, already given ${used})`,
-        );
+    if (packagingMode) {
+      for (const [typeId, cans] of requestedCansByType) {
+        if (cans <= 0) continue;
+        const opening = openingCansByType.get(typeId) ?? 0;
+        const used = alreadyCansByType.get(typeId) ?? 0;
+        const available = opening - used;
+        if (cans > available) {
+          throw new BadRequestException(
+            `Only ${available} filled cans left on this run for packaging type (opening ${opening}, already given ${used})`,
+          );
+        }
+      }
+    } else {
+      for (const [productId, cans] of requestedCans) {
+        if (cans <= 0) continue;
+        const opening = openingCans.get(productId) ?? 0;
+        const used = alreadyCans.get(productId) ?? 0;
+        const available = opening - used;
+        if (cans > available) {
+          const name = productMap.get(productId)?.name ?? 'product';
+          throw new BadRequestException(
+            `Only ${available} filled cans left on this run for "${name}" (opening ${opening}, already given ${used})`,
+          );
+        }
       }
     }
   }

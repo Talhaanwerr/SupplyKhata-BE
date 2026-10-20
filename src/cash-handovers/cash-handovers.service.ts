@@ -1,5 +1,5 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { DeliveryStatus as PrismaDeliveryStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { parseCalendarDateUtc } from '../common/helpers/calendar-utc.helper';
 import { AuditLogsService } from '../audit-logs/audit-logs.service';
@@ -17,7 +17,7 @@ function decimalToNumber(value: DecimalLike): number {
 }
 
 function parseDate(value: string): Date {
-  const parsed = new Date(value);
+  const parsed = parseCalendarDateUtc(value, false);
   if (Number.isNaN(parsed.getTime())) {
     throw new BadRequestException('Invalid date');
   }
@@ -54,6 +54,13 @@ export class CashHandoversService {
     await this.assertTenantMember(tenantId, dto.receivedById, 'receivedBy');
     if (dto.deliveryRunId) {
       await this.assertDeliveryRun(tenantId, dto.deliveryRunId);
+    }
+
+    const balance = await this.riderCashBalance(tenantId, dto.riderId);
+    if (dto.amount > balance.currentBalance + 1e-9) {
+      throw new BadRequestException(
+        `Amount exceeds rider cash balance (${balance.currentBalance.toFixed(2)})`,
+      );
     }
 
     const handover = await this.prisma.cashHandover.create({
@@ -140,6 +147,17 @@ export class CashHandoversService {
       await this.assertDeliveryRun(tenantId, dto.deliveryRunId);
     }
 
+    const nextAmount = dto.amount !== undefined ? dto.amount : decimalToNumber(existing.amount);
+    const balance = await this.riderCashBalance(tenantId, nextRiderId);
+    // Editing frees this handover's amount back into the rider's available balance.
+    const maxAllowed =
+      nextRiderId === existing.riderId
+        ? roundMoney(balance.currentBalance + decimalToNumber(existing.amount))
+        : balance.currentBalance;
+    if (nextAmount > maxAllowed + 1e-9) {
+      throw new BadRequestException(`Amount exceeds rider cash balance (${maxAllowed.toFixed(2)})`);
+    }
+
     const oldValue = {
       riderId: existing.riderId,
       receivedById: existing.receivedById,
@@ -215,6 +233,7 @@ export class CashHandoversService {
       this.prisma.delivery.aggregate({
         where: {
           tenantId,
+          status: { not: PrismaDeliveryStatus.CANCELLED },
           deliveryRun: { riderId },
         },
         _sum: { cashReceived: true },

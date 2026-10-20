@@ -12,6 +12,7 @@ import { UpdateRoleDto } from './dto/update-role.dto';
 import { AssignPermissionsDto } from './dto/assign-permissions.dto';
 import { AssignRoleToUserDto } from './dto/assign-role-to-user.dto';
 import { getPaginationParams, buildPaginationMeta } from '../common/helpers/pagination.helper';
+import { getFeatureDisabledPermissionModules } from '../common/helpers/permission-feature-flags.helper';
 import { ListRolesQueryDto } from './dto/list-roles-query.dto';
 
 /** System roles visible inside a tenant workspace (never super_admin). */
@@ -32,24 +33,31 @@ function tenantPermissionWhere() {
   };
 }
 
-const ROLE_SELECT = {
-  id: true,
-  tenantId: true,
-  name: true,
-  slug: true,
-  description: true,
-  isSystem: true,
-  createdAt: true,
-  updatedAt: true,
-  permissions: {
-    select: {
-      permission: {
-        select: { id: true, module: true, action: true, description: true },
+/** System roles are global (tenantId null); count only assignments in this workspace. */
+function roleSelect(tenantId: string) {
+  return {
+    id: true,
+    tenantId: true,
+    name: true,
+    slug: true,
+    description: true,
+    isSystem: true,
+    createdAt: true,
+    updatedAt: true,
+    permissions: {
+      select: {
+        permission: {
+          select: { id: true, module: true, action: true, description: true },
+        },
       },
     },
-  },
-  _count: { select: { userRoles: true } },
-} as const;
+    _count: {
+      select: {
+        userRoles: { where: { tenantId } },
+      },
+    },
+  } as const;
+}
 
 function slugifyRoleName(name: string): string {
   const slug = name
@@ -107,7 +115,7 @@ export class RolesService {
     const [roles, total] = await Promise.all([
       this.prisma.role.findMany({
         where,
-        select: ROLE_SELECT,
+        select: roleSelect(tenantId),
         orderBy: [{ isSystem: 'desc' }, { name: 'asc' }],
         skip,
         take,
@@ -124,7 +132,7 @@ export class RolesService {
   async getRole(id: string, tenantId: string, isSuperAdmin: boolean) {
     const role = await this.prisma.role.findUnique({
       where: { id },
-      select: ROLE_SELECT,
+      select: roleSelect(tenantId),
     });
 
     if (!role) throw new NotFoundException('Role not found');
@@ -148,7 +156,7 @@ export class RolesService {
         description: dto.description,
         isSystem: false,
       },
-      select: ROLE_SELECT,
+      select: roleSelect(tenantId),
     });
 
     await this.audit.write({
@@ -170,7 +178,10 @@ export class RolesService {
     isSuperAdmin: boolean,
     actorId: string,
   ) {
-    const role = await this.prisma.role.findUnique({ where: { id }, select: ROLE_SELECT });
+    const role = await this.prisma.role.findUnique({
+      where: { id },
+      select: roleSelect(tenantId),
+    });
     if (!role) throw new NotFoundException('Role not found');
     if (role.isSystem) throw new ForbiddenException('System roles cannot be modified');
     this.assertRoleAccess(role, tenantId, isSuperAdmin);
@@ -178,7 +189,7 @@ export class RolesService {
     const updated = await this.prisma.role.update({
       where: { id },
       data: dto,
-      select: ROLE_SELECT,
+      select: roleSelect(tenantId),
     });
 
     await this.audit.write({
@@ -200,7 +211,9 @@ export class RolesService {
     if (role.isSystem) throw new ForbiddenException('System roles cannot be deleted');
     this.assertRoleAccess(role, tenantId, isSuperAdmin);
 
-    const assignedUsers = await this.prisma.userRole.count({ where: { roleId: id } });
+    const assignedUsers = await this.prisma.userRole.count({
+      where: { roleId: id, tenantId },
+    });
     if (assignedUsers > 0) {
       throw new ConflictException(
         `Cannot delete role: it is assigned to ${assignedUsers} user(s). Unassign it first.`,
@@ -221,12 +234,15 @@ export class RolesService {
 
   // ─── Permissions ───────────────────────────────────────────────────────
 
-  async listPermissions(isSuperAdmin: boolean) {
+  async listPermissions(isSuperAdmin: boolean, tenantId: string) {
     const perms = await this.prisma.permission.findMany({
       where: isSuperAdmin ? undefined : tenantPermissionWhere(),
       orderBy: [{ module: 'asc' }, { action: 'asc' }],
     });
-    return perms;
+    // Tenant UI: only show modules whose feature flags are ON for this workspace.
+    const disabledModules = await getFeatureDisabledPermissionModules(this.prisma, tenantId);
+    if (disabledModules.size === 0) return perms;
+    return perms.filter((p) => !disabledModules.has(p.module));
   }
 
   /**
@@ -247,15 +263,21 @@ export class RolesService {
       throw new ForbiddenException('Cannot modify Super Admin permissions');
     }
 
+    const disabledModules = await getFeatureDisabledPermissionModules(this.prisma, tenantId);
+
     const [existing, catalog] = await Promise.all([
       this.prisma.rolePermission.findMany({ where: { roleId }, select: { permissionId: true } }),
       this.prisma.permission.findMany({
         where: isSuperAdmin ? undefined : tenantPermissionWhere(),
-        select: { id: true },
+        select: { id: true, module: true },
       }),
     ]);
 
-    const catalogIds = new Set(catalog.map((p) => p.id));
+    // Assignable catalog = tenant-safe modules that are feature-enabled for this workspace.
+    // Flag-disabled module grants already on the role are left untouched (not in syncable set).
+    const catalogIds = new Set(
+      catalog.filter((p) => !disabledModules.has(p.module)).map((p) => p.id),
+    );
     const incoming = dto.permissionIds.filter((id) => catalogIds.has(id));
 
     if (isSuperAdmin) {
@@ -268,7 +290,7 @@ export class RolesService {
       }
     } else if (dto.permissionIds.some((id) => !catalogIds.has(id))) {
       throw new ForbiddenException(
-        'Cannot assign platform-only permissions (tenants, subscriptions, feature-flags, or non-read audit-logs)',
+        'Cannot assign platform-only or feature-disabled permissions for this workspace',
       );
     }
 

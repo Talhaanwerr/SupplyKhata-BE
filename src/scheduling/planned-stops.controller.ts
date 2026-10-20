@@ -21,8 +21,12 @@ export class PlannedStopsController {
 
   @Get()
   @RequirePermissions('planned-stops:read')
-  list(@Query() query: ListPlannedStopsQueryDto, @CurrentTenant() tenantId: string) {
-    return this.scheduling.listPlannedStops(tenantId, query);
+  list(
+    @Query() query: ListPlannedStopsQueryDto,
+    @CurrentTenant() tenantId: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.scheduling.listPlannedStops(tenantId, query, user.id);
   }
 
   @Post()
@@ -66,5 +70,16 @@ export class PlannedStopsController {
     @CurrentUser() user: AuthenticatedUser,
   ) {
     return this.scheduling.failStop(id, tenantId, dto, user.id);
+  }
+
+  /** Create Orders DRAFT from stop; marks stop CANCELLED (not deliverable). */
+  @Post(':id/convert-to-order')
+  @RequirePermissions('orders:create')
+  convertToOrder(
+    @Param('id') id: string,
+    @CurrentTenant() tenantId: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.scheduling.convertToOrder(id, tenantId, user.id);
   }
 }

@@ -20,9 +20,11 @@ import { isProductionEnabled } from '../common/helpers/production.helper';
 import { isVendorsEnabled } from '../common/helpers/vendors.helper';
 import {
   endOfUtcDay,
+  endOfZonedDayUtc,
   formatCalendarDateUtc,
   parseCalendarDateUtc,
   startOfTodayInTimeZoneUtc,
+  startOfZonedDayUtc,
 } from '../common/helpers/calendar-utc.helper';
 import { getTenantTimezone } from '../common/helpers/tenant-timezone.helper';
 import {
@@ -126,7 +128,16 @@ export class ReportsService {
           },
         },
         items: {
-          include: { product: { select: { id: true, name: true } } },
+          include: {
+            product: {
+              select: {
+                id: true,
+                name: true,
+                packagingTypeId: true,
+                packagingType: { select: { id: true, name: true } },
+              },
+            },
+          },
         },
       },
     });
@@ -149,7 +160,10 @@ export class ReportsService {
           productId: i.productId,
           productName: i.product.name,
           quantityDelivered: decimalToNumber(i.quantityDelivered),
+          containersDelivered: i.containersDelivered,
           emptiesReceived: i.emptiesReceived,
+          packagingTypeId: i.product.packagingTypeId,
+          packagingTypeName: i.product.packagingType?.name ?? null,
           unitPrice: round2(decimalToNumber(i.sellingPriceSnapshot)),
           lineTotal: round2(decimalToNumber(i.lineTotal)),
           unitCost: round2(decimalToNumber(i.unitCostSnapshot)),
@@ -159,8 +173,15 @@ export class ReportsService {
   }
 
   async monthlySummary(tenantId: string, query: MonthlySummaryQueryDto) {
-    const from = new Date(query.year, query.month - 1, 1, 0, 0, 0, 0);
-    const to = new Date(query.year, query.month, 0, 23, 59, 59, 999);
+    // Calendar month in UTC Y-M-D (not server local Date) so order Place timestamps
+    // and deliveryDate filters stay consistent across environments.
+    const y = query.year;
+    const m = query.month;
+    const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+    const fromYmd = `${y}-${String(m).padStart(2, '0')}-01`;
+    const toYmd = `${y}-${String(m).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
+    const from = parseCalendarDateUtc(fromYmd, false);
+    const to = parseCalendarDateUtc(toYmd, true);
     const channel = await this.resolveSalesChannel(tenantId, query.channel);
 
     const [expensesAgg, refillAgg] = await Promise.all([
@@ -362,15 +383,23 @@ export class ReportsService {
   }
 
   /**
-   * Billable orders whose PLACED event falls in [from, to].
+   * Billable orders whose PLACED event falls in the tenant-local calendar range.
+   * `from`/`to` are treated as calendar days (UTC Y-M-D of those Dates); `OrderStatusEvent.at`
+   * is a real timestamp so we expand to start/end of day in the tenant timezone.
    * Excludes DRAFT / CANCELLED / REFUNDED. Matches ORDER_SALE recognition date.
    */
   private async loadBillableOrdersInRange(tenantId: string, from: Date, to: Date) {
+    const tz = await getTenantTimezone(this.prisma, tenantId);
+    const fromYmd = formatCalendarDateUtc(from);
+    const toYmd = formatCalendarDateUtc(to);
+    const fromAt = startOfZonedDayUtc(fromYmd, tz);
+    const toAt = endOfZonedDayUtc(toYmd, tz);
+
     const placedEvents = await this.prisma.orderStatusEvent.findMany({
       where: {
         tenantId,
         toStatus: PrismaOrderStatus.PLACED,
-        at: { gte: from, lte: to },
+        at: { gte: fromAt, lte: toAt },
         order: {
           tenantId,
           deletedAt: null,
@@ -540,7 +569,7 @@ export class ReportsService {
 
   async containerInventoryReport(tenantId: string) {
     const rows = await this.containers.inventory(tenantId);
-    return { products: rows };
+    return { packagingTypes: rows };
   }
 
   async riderCollection(tenantId: string, query: RiderCollectionQueryDto) {
@@ -1302,7 +1331,10 @@ export class ReportsService {
               rider: d.riderName,
               product: item.productName,
               qty: item.quantityDelivered,
+              cans: item.containersDelivered,
               empties: item.emptiesReceived,
+              packagingTypeId: item.packagingTypeId,
+              packagingTypeName: item.packagingTypeName,
               unitPrice: item.unitPrice,
               lineTotal: item.lineTotal,
               cashReceived: d.cashReceived,
@@ -1318,7 +1350,10 @@ export class ReportsService {
             'rider',
             'product',
             'qty',
+            'cans',
             'empties',
+            'packagingTypeId',
+            'packagingTypeName',
             'unitPrice',
             'lineTotal',
             'cashReceived',
@@ -1387,20 +1422,22 @@ export class ReportsService {
         return {
           title: 'Container Inventory',
           headers: [
-            'productId',
-            'productName',
+            'packagingTypeId',
+            'name',
             'ownedTotal',
             'withCustomers',
             'onVehicles',
             'onHand',
+            'productNames',
           ],
-          rows: data.products.map((p) => ({
-            productId: p.productId,
-            productName: p.productName,
+          rows: data.packagingTypes.map((p) => ({
+            packagingTypeId: p.packagingTypeId,
+            name: p.name,
             ownedTotal: p.ownedTotal,
             withCustomers: p.withCustomers,
             onVehicles: p.onVehicles,
             onHand: p.onHand,
+            productNames: (p.productNames ?? []).join('; '),
           })),
         };
       }

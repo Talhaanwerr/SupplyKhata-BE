@@ -1,5 +1,5 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { Prisma, PurchaseOrderStatus } from '@prisma/client';
+import { Prisma, PurchaseOrderStatus, VendorBillStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { parseCalendarDateUtc } from '../common/helpers/calendar-utc.helper';
 import { AuditLogsService } from '../audit-logs/audit-logs.service';
@@ -21,7 +21,7 @@ function decimalToNumber(value: DecimalLike): number {
 }
 
 function parseDate(value: string): Date {
-  const parsed = new Date(value);
+  const parsed = parseCalendarDateUtc(value, false);
   if (Number.isNaN(parsed.getTime())) {
     throw new BadRequestException('Invalid date');
   }
@@ -324,19 +324,35 @@ export class PurchaseOrdersService {
     const rawIds = normalized.map((l) => l.rawMaterialId).filter((id): id is string => !!id);
 
     if (productIds.length) {
-      const count = await this.prisma.product.count({
-        where: { tenantId, id: { in: productIds }, deletedAt: null },
+      const uniqueIds = [...new Set(productIds)];
+      const products = await this.prisma.product.findMany({
+        where: { tenantId, id: { in: uniqueIds }, deletedAt: null },
+        select: { id: true, name: true, isActive: true },
       });
-      if (count !== new Set(productIds).size) {
+      if (products.length !== uniqueIds.length) {
         throw new BadRequestException('One or more products were not found');
+      }
+      const inactive = products.filter((p) => !p.isActive);
+      if (inactive.length) {
+        throw new BadRequestException(
+          `Cannot add inactive product(s): ${inactive.map((p) => p.name).join(', ')}`,
+        );
       }
     }
     if (rawIds.length) {
-      const count = await this.prisma.rawMaterial.count({
-        where: { tenantId, id: { in: rawIds } },
+      const uniqueIds = [...new Set(rawIds)];
+      const raws = await this.prisma.rawMaterial.findMany({
+        where: { tenantId, id: { in: uniqueIds } },
+        select: { id: true, name: true, isActive: true },
       });
-      if (count !== new Set(rawIds).size) {
+      if (raws.length !== uniqueIds.length) {
         throw new BadRequestException('One or more raw materials were not found');
+      }
+      const inactive = raws.filter((r) => !r.isActive);
+      if (inactive.length) {
+        throw new BadRequestException(
+          `Cannot add inactive raw material(s): ${inactive.map((r) => r.name).join(', ')}`,
+        );
       }
     }
 
@@ -378,6 +394,108 @@ export class PurchaseOrdersService {
       cancelReason: r.cancelReason,
       createdAt: r.createdAt,
       updatedAt: r.updatedAt,
+    };
+  }
+
+  /**
+   * Compare PO-line received qty vs billed qty (non-void bills linked to PO lines).
+   */
+  async grnBillAudit(tenantId: string, opts?: { mismatchesOnly?: boolean }) {
+    await assertPurchaseOrdersEnabled(this.prisma, tenantId);
+
+    const pos = await this.prisma.purchaseOrder.findMany({
+      where: {
+        tenantId,
+        status: {
+          in: [
+            PurchaseOrderStatus.PARTIALLY_RECEIVED,
+            PurchaseOrderStatus.RECEIVED,
+            PurchaseOrderStatus.SENT,
+          ],
+        },
+        OR: [{ lines: { some: { qtyReceived: { gt: 0 } } } }, { bills: { some: {} } }],
+      },
+      include: {
+        vendor: { select: { id: true, name: true } },
+        lines: {
+          include: {
+            product: { select: { id: true, name: true, sku: true } },
+            rawMaterial: { select: { id: true, name: true, sku: true } },
+          },
+          orderBy: { lineNo: 'asc' },
+        },
+      },
+      orderBy: { updatedAt: 'desc' },
+      take: 200,
+    });
+
+    const poLineIds = pos.flatMap((p) => p.lines.map((l) => l.id));
+    const billedByLine = new Map<string, number>();
+
+    if (poLineIds.length > 0) {
+      const billLines = await this.prisma.vendorBillLine.findMany({
+        where: {
+          tenantId,
+          purchaseOrderLineId: { in: poLineIds },
+          vendorBill: { status: { not: VendorBillStatus.VOID } },
+        },
+        select: {
+          purchaseOrderLineId: true,
+          qty: true,
+        },
+      });
+      for (const bl of billLines) {
+        if (!bl.purchaseOrderLineId) continue;
+        const prev = billedByLine.get(bl.purchaseOrderLineId) ?? 0;
+        billedByLine.set(bl.purchaseOrderLineId, prev + decimalToNumber(bl.qty));
+      }
+    }
+
+    const items = [];
+    for (const po of pos) {
+      const lines = po.lines.map((l) => {
+        const qtyOrdered = decimalToNumber(l.qtyOrdered);
+        const qtyReceived = decimalToNumber(l.qtyReceived);
+        const qtyBilled = billedByLine.get(l.id) ?? 0;
+        const delta = Math.round((qtyBilled - qtyReceived) * 1000) / 1000;
+        const mismatch = Math.abs(delta) > 0.0005;
+        const name =
+          l.product?.name ?? l.rawMaterial?.name ?? l.productId ?? l.rawMaterialId ?? l.id;
+        return {
+          purchaseOrderLineId: l.id,
+          lineNo: l.lineNo,
+          name,
+          productId: l.productId,
+          rawMaterialId: l.rawMaterialId,
+          qtyOrdered,
+          qtyReceived,
+          qtyBilled,
+          delta,
+          mismatch,
+        };
+      });
+
+      const hasActivity = lines.some((l) => l.qtyReceived > 0 || l.qtyBilled > 0);
+      if (!hasActivity) continue;
+
+      const mismatchCount = lines.filter((l) => l.mismatch).length;
+      if (opts?.mismatchesOnly && mismatchCount === 0) continue;
+
+      items.push({
+        purchaseOrderId: po.id,
+        poNumber: po.poNumber,
+        status: po.status,
+        vendor: po.vendor,
+        mismatchCount,
+        lines: opts?.mismatchesOnly ? lines.filter((l) => l.mismatch) : lines,
+      });
+    }
+
+    return {
+      mismatchesOnly: !!opts?.mismatchesOnly,
+      poCount: items.length,
+      mismatchPoCount: items.filter((i) => i.mismatchCount > 0).length,
+      items,
     };
   }
 

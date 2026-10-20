@@ -6,6 +6,7 @@ import { InventoryService } from '../inventory/inventory.service';
 import { getPaginationParams, buildPaginationMeta } from '../common/helpers/pagination.helper';
 import { isWarehouseEnabled } from '../common/helpers/inventory.helper';
 import { assertRawMaterialsEnabled } from '../common/helpers/raw-materials.helper';
+import { lockRawMaterialBalance } from '../common/helpers/stock-lock.helper';
 import { CreateRawMaterialDto, UpdateRawMaterialDto } from './dto/raw-material.dto';
 import {
   ListRawBalancesQueryDto,
@@ -83,17 +84,97 @@ export class RawMaterialsService {
             ],
           }
         : {}),
-      ...(lowStockOnly ? { reorderLevel: { not: null } } : {}),
     };
 
-    // lowStockOnly needs on-hand before paginating; keep cap for safety.
-    const rows = await this.prisma.rawMaterial.findMany({
-      where,
-      orderBy: { name: 'asc' },
-      skip: lowStockOnly ? 0 : (page - 1) * limit,
-      take: lowStockOnly ? 500 : limit,
-    });
-    const totalAll = lowStockOnly ? rows.length : await this.prisma.rawMaterial.count({ where });
+    // On-hand is SUM(balances); Prisma can't compare that to reorderLevel — SQL + LIMIT/OFFSET.
+    if (lowStockOnly) {
+      const activeFilter =
+        query.isActive != null ? Prisma.sql`AND rm.isActive = ${query.isActive}` : Prisma.empty;
+      const search = query.search?.trim();
+      const searchFilter = search
+        ? Prisma.sql`AND (rm.name LIKE ${`%${search}%`} OR rm.sku LIKE ${`%${search}%`})`
+        : Prisma.empty;
+      const skip = (page - 1) * limit;
+
+      const [countRows, idRows] = await Promise.all([
+        this.prisma.$queryRaw<Array<{ total: bigint | number }>>`
+          SELECT COUNT(*) AS total
+          FROM raw_materials rm
+          LEFT JOIN (
+            SELECT rawMaterialId, SUM(quantity) AS onHand
+            FROM raw_material_balances
+            WHERE tenantId = ${tenantId}
+            GROUP BY rawMaterialId
+          ) bal ON bal.rawMaterialId = rm.id
+          WHERE rm.tenantId = ${tenantId}
+            AND rm.reorderLevel IS NOT NULL
+            AND COALESCE(bal.onHand, 0) <= rm.reorderLevel
+            ${activeFilter}
+            ${searchFilter}
+        `,
+        this.prisma.$queryRaw<Array<{ id: string }>>`
+          SELECT rm.id AS id
+          FROM raw_materials rm
+          LEFT JOIN (
+            SELECT rawMaterialId, SUM(quantity) AS onHand
+            FROM raw_material_balances
+            WHERE tenantId = ${tenantId}
+            GROUP BY rawMaterialId
+          ) bal ON bal.rawMaterialId = rm.id
+          WHERE rm.tenantId = ${tenantId}
+            AND rm.reorderLevel IS NOT NULL
+            AND COALESCE(bal.onHand, 0) <= rm.reorderLevel
+            ${activeFilter}
+            ${searchFilter}
+          ORDER BY rm.name ASC
+          LIMIT ${limit} OFFSET ${skip}
+        `,
+      ]);
+
+      const total = Number(countRows[0]?.total ?? 0);
+      const ids = idRows.map((r) => r.id);
+      if (ids.length === 0) {
+        return { items: [], meta: buildPaginationMeta(total, page, limit) };
+      }
+
+      const rows = await this.prisma.rawMaterial.findMany({
+        where: { id: { in: ids } },
+      });
+      const byId = new Map(rows.map((r) => [r.id, r]));
+      const grouped = await this.prisma.rawMaterialBalance.groupBy({
+        by: ['rawMaterialId'],
+        where: { tenantId, rawMaterialId: { in: ids } },
+        _sum: { quantity: true },
+      });
+      const onHandById = new Map(
+        grouped.map((g) => [g.rawMaterialId, decimalToNumber(g._sum.quantity) ?? 0]),
+      );
+
+      const items = ids
+        .map((id) => byId.get(id))
+        .filter((r): r is NonNullable<typeof r> => r != null)
+        .map((r) => {
+          const onHandQty = onHandById.get(r.id) ?? 0;
+          const reorder = decimalToNumber(r.reorderLevel);
+          return {
+            ...this.mapRawMaterial(r),
+            onHandQty,
+            isLowStock: reorder != null && onHandQty <= reorder,
+          };
+        });
+
+      return { items, meta: buildPaginationMeta(total, page, limit) };
+    }
+
+    const [rows, totalAll] = await Promise.all([
+      this.prisma.rawMaterial.findMany({
+        where,
+        orderBy: { name: 'asc' },
+        skip: (page - 1) * limit,
+        take: limit,
+      }),
+      this.prisma.rawMaterial.count({ where }),
+    ]);
 
     const ids = rows.map((r) => r.id);
     const grouped =
@@ -108,24 +189,15 @@ export class RawMaterialsService {
       grouped.map((g) => [g.rawMaterialId, decimalToNumber(g._sum.quantity) ?? 0]),
     );
 
-    let items = rows.map((r) => {
+    const items = rows.map((r) => {
       const onHandQty = onHandById.get(r.id) ?? 0;
       const reorder = decimalToNumber(r.reorderLevel);
-      const isLowStock = reorder != null && onHandQty <= reorder;
       return {
         ...this.mapRawMaterial(r),
         onHandQty,
-        isLowStock,
+        isLowStock: reorder != null && onHandQty <= reorder,
       };
     });
-
-    if (lowStockOnly) {
-      items = items.filter((r) => r.isLowStock);
-      const total = items.length;
-      const start = (page - 1) * limit;
-      items = items.slice(start, start + limit);
-      return { items, meta: buildPaginationMeta(total, page, limit) };
-    }
 
     return {
       items,
@@ -371,37 +443,33 @@ export class RawMaterialsService {
       if (activeCount <= 1) locationId = defaultLoc.id;
     }
 
-    const where: Prisma.RawMaterialBalanceWhereInput = {
-      tenantId,
-      ...(locationId ? { locationId } : {}),
-      ...(query.rawMaterialId ? { rawMaterialId: query.rawMaterialId } : {}),
-      ...(query.lowStockOnly ? { rawMaterial: { reorderLevel: { not: null } } } : {}),
-    };
-
-    const [rows, total] = await Promise.all([
-      this.prisma.rawMaterialBalance.findMany({
-        where,
-        skip,
-        take,
-        orderBy: [{ updatedAt: 'desc' }],
-        include: {
-          rawMaterial: {
-            select: {
-              id: true,
-              name: true,
-              sku: true,
-              unit: true,
-              reorderLevel: true,
-              isActive: true,
-            },
-          },
-          location: { select: locationSelect },
+    const balanceInclude = {
+      rawMaterial: {
+        select: {
+          id: true,
+          name: true,
+          sku: true,
+          unit: true,
+          reorderLevel: true,
+          isActive: true,
         },
-      }),
-      this.prisma.rawMaterialBalance.count({ where }),
-    ]);
+      },
+      location: { select: locationSelect },
+    } as const;
 
-    let items = rows.map((r) => ({
+    const mapBalanceRow = <
+      T extends {
+        id: string;
+        quantity: Prisma.Decimal;
+        locationId: string;
+        rawMaterialId: string;
+        updatedAt: Date;
+        rawMaterial: { reorderLevel: Prisma.Decimal | null };
+        location: unknown;
+      },
+    >(
+      r: T,
+    ) => ({
       id: r.id,
       quantity: decimalToNumber(r.quantity) ?? 0,
       locationId: r.locationId,
@@ -412,17 +480,84 @@ export class RawMaterialsService {
         reorderLevel: decimalToNumber(r.rawMaterial.reorderLevel),
       },
       location: r.location,
-    }));
+    });
 
+    // Prisma cannot express quantity <= rawMaterial.reorderLevel; SQL JOIN + LIMIT/OFFSET.
     if (query.lowStockOnly) {
-      items = items.filter(
-        (r) => r.rawMaterial.reorderLevel != null && r.quantity <= r.rawMaterial.reorderLevel,
-      );
+      const locationFilter = locationId
+        ? Prisma.sql`AND rmb.locationId = ${locationId}`
+        : Prisma.empty;
+      const materialFilter = query.rawMaterialId
+        ? Prisma.sql`AND rmb.rawMaterialId = ${query.rawMaterialId}`
+        : Prisma.empty;
+
+      const [countRows, idRows] = await Promise.all([
+        this.prisma.$queryRaw<Array<{ total: bigint | number }>>`
+          SELECT COUNT(*) AS total
+          FROM raw_material_balances rmb
+          INNER JOIN raw_materials rm ON rm.id = rmb.rawMaterialId
+          WHERE rmb.tenantId = ${tenantId}
+            AND rm.reorderLevel IS NOT NULL
+            AND rmb.quantity <= rm.reorderLevel
+            ${locationFilter}
+            ${materialFilter}
+        `,
+        this.prisma.$queryRaw<Array<{ id: string }>>`
+          SELECT rmb.id AS id
+          FROM raw_material_balances rmb
+          INNER JOIN raw_materials rm ON rm.id = rmb.rawMaterialId
+          WHERE rmb.tenantId = ${tenantId}
+            AND rm.reorderLevel IS NOT NULL
+            AND rmb.quantity <= rm.reorderLevel
+            ${locationFilter}
+            ${materialFilter}
+          ORDER BY rmb.updatedAt DESC
+          LIMIT ${take} OFFSET ${skip}
+        `,
+      ]);
+
+      const total = Number(countRows[0]?.total ?? 0);
+      const ids = idRows.map((r) => r.id);
+      if (ids.length === 0) {
+        return { items: [], meta: buildPaginationMeta(total, page, limit) };
+      }
+
+      const rows = await this.prisma.rawMaterialBalance.findMany({
+        where: { id: { in: ids } },
+        include: balanceInclude,
+      });
+      const byId = new Map(rows.map((r) => [r.id, r]));
+      const items = ids
+        .map((id) => byId.get(id))
+        .filter((r): r is NonNullable<typeof r> => r != null)
+        .map((r) => mapBalanceRow(r));
+
+      return {
+        items,
+        meta: buildPaginationMeta(total, page, limit),
+      };
     }
 
+    const where: Prisma.RawMaterialBalanceWhereInput = {
+      tenantId,
+      ...(locationId ? { locationId } : {}),
+      ...(query.rawMaterialId ? { rawMaterialId: query.rawMaterialId } : {}),
+    };
+
+    const [rows, total] = await Promise.all([
+      this.prisma.rawMaterialBalance.findMany({
+        where,
+        skip,
+        take,
+        orderBy: [{ updatedAt: 'desc' }],
+        include: balanceInclude,
+      }),
+      this.prisma.rawMaterialBalance.count({ where }),
+    ]);
+
     return {
-      items,
-      meta: buildPaginationMeta(query.lowStockOnly ? items.length : total, page, limit),
+      items: rows.map((r) => mapBalanceRow(r)),
+      meta: buildPaginationMeta(total, page, limit),
     };
   }
 
@@ -612,37 +747,22 @@ export class RawMaterialsService {
       actorId: string;
     },
   ) {
-    const balance = await tx.rawMaterialBalance.findUnique({
-      where: {
-        tenantId_locationId_rawMaterialId: {
-          tenantId: args.tenantId,
-          locationId: args.locationId,
-          rawMaterialId: args.rawMaterialId,
-        },
-      },
+    const balance = await lockRawMaterialBalance(tx, {
+      tenantId: args.tenantId,
+      locationId: args.locationId,
+      rawMaterialId: args.rawMaterialId,
     });
 
-    const current = balance ? new Prisma.Decimal(balance.quantity) : new Prisma.Decimal(0);
+    const current = new Prisma.Decimal(balance.quantity);
     const next = current.add(args.quantity);
     if (next.lessThan(0)) {
       throw new BadRequestException('Insufficient stock: resulting quantity would be negative');
     }
 
-    if (balance) {
-      await tx.rawMaterialBalance.update({
-        where: { id: balance.id },
-        data: { quantity: next },
-      });
-    } else {
-      await tx.rawMaterialBalance.create({
-        data: {
-          tenantId: args.tenantId,
-          locationId: args.locationId,
-          rawMaterialId: args.rawMaterialId,
-          quantity: next,
-        },
-      });
-    }
+    await tx.rawMaterialBalance.update({
+      where: { id: balance.id },
+      data: { quantity: next },
+    });
 
     return tx.rawMaterialMovement.create({
       data: {

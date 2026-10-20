@@ -29,7 +29,7 @@ function decimalToNumber(value: DecimalLike): number {
 }
 
 function parseLedgerDate(value: string): Date {
-  const parsed = new Date(value);
+  const parsed = parseCalendarDateUtc(value, false);
   if (Number.isNaN(parsed.getTime())) {
     throw new BadRequestException('Invalid date');
   }
@@ -245,7 +245,8 @@ export class CustomersService {
           await tx.containerMovement.create({
             data: {
               tenantId,
-              productId: row.productId,
+              packagingTypeId: row.packagingTypeId,
+              productId: null,
               customerId: created.id,
               quantity: row.quantity,
               movementType: ContainerMovementType.OPENING_WITH_CUSTOMER,
@@ -418,9 +419,18 @@ export class CustomersService {
       return [];
     }
 
-    const products = await this.prisma.product.findMany({
-      where: { tenantId, deletedAt: null, isReturnable: true },
-      select: { id: true, name: true },
+    const packagingTypes = await this.prisma.packagingType.findMany({
+      where: { tenantId, deletedAt: null },
+      select: {
+        id: true,
+        name: true,
+        capacity: true,
+        products: {
+          where: { deletedAt: null, isReturnable: true },
+          select: { name: true },
+          orderBy: { name: 'asc' },
+        },
+      },
       orderBy: { name: 'asc' },
     });
 
@@ -428,26 +438,35 @@ export class CustomersService {
       where: {
         tenantId,
         customerId: id,
-        productId: { in: products.map((p) => p.id) },
+        packagingTypeId: { in: packagingTypes.map((p) => p.id) },
       },
-      select: { productId: true, movementType: true, quantity: true },
+      select: { packagingTypeId: true, movementType: true, quantity: true },
     });
 
-    const balanceByProduct = new Map<string, { balance: number; movementsCount: number }>();
+    const balanceByType = new Map<string, { balance: number; movementsCount: number }>();
     for (const m of movements) {
-      const prev = balanceByProduct.get(m.productId) ?? { balance: 0, movementsCount: 0 };
+      if (!m.packagingTypeId) continue;
+      const prev = balanceByType.get(m.packagingTypeId) ?? { balance: 0, movementsCount: 0 };
       prev.balance += customerContainerSignedQty(m.movementType, m.quantity);
       prev.movementsCount += 1;
-      balanceByProduct.set(m.productId, prev);
+      balanceByType.set(m.packagingTypeId, prev);
     }
 
-    return products.map((product) => {
-      const row = balanceByProduct.get(product.id);
+    return packagingTypes.map((type) => {
+      const row = balanceByType.get(type.id);
+      const capacity =
+        type.capacity == null
+          ? null
+          : typeof type.capacity === 'number'
+            ? type.capacity
+            : Number(type.capacity.toString());
       return {
-        productId: product.id,
-        productName: product.name,
+        packagingTypeId: type.id,
+        name: type.name,
+        capacity,
         balance: row?.balance ?? 0,
         movementsCount: row?.movementsCount ?? 0,
+        productNames: type.products.map((p) => p.name),
       };
     });
   }
@@ -464,12 +483,13 @@ export class CustomersService {
 
     await assertReturnableContainersEnabled(this.prisma, tenantId);
     await this.findActiveOrThrow(id, tenantId);
-    await this.assertReturnableProduct(this.prisma, tenantId, dto.productId);
+    await this.assertActivePackagingType(this.prisma, tenantId, dto.packagingTypeId);
 
     const movement = await this.prisma.containerMovement.create({
       data: {
         tenantId,
-        productId: dto.productId,
+        packagingTypeId: dto.packagingTypeId,
+        productId: null,
         customerId: id,
         quantity: dto.quantityDelta,
         movementType: ContainerMovementType.ADJUSTMENT,
@@ -485,7 +505,7 @@ export class CustomersService {
       entityId: id,
       newValue: {
         containerAdjustment: {
-          productId: dto.productId,
+          packagingTypeId: dto.packagingTypeId,
           quantityDelta: dto.quantityDelta,
           movementId: movement.id,
         },
@@ -530,21 +550,21 @@ export class CustomersService {
       }),
       this.prisma.containerMovement.findMany({
         where: { tenantId, customerId },
-        select: { productId: true, movementType: true, quantity: true },
+        select: { packagingTypeId: true, movementType: true, quantity: true },
       }),
     ]);
 
     const balance = Math.round(decimalToNumber(ledgerAgg._sum.amount) * 100) / 100;
-    const cansByProduct = new Map<string, number>();
+    const cansByType = new Map<string, number>();
     for (const m of movements) {
-      cansByProduct.set(
-        m.productId,
-        (cansByProduct.get(m.productId) ?? 0) +
-          customerContainerSignedQty(m.movementType, m.quantity),
+      const key = m.packagingTypeId ?? '_unknown';
+      cansByType.set(
+        key,
+        (cansByType.get(key) ?? 0) + customerContainerSignedQty(m.movementType, m.quantity),
       );
     }
     let cansWithCustomer = 0;
-    for (const qty of cansByProduct.values()) {
+    for (const qty of cansByType.values()) {
       if (qty > 0) cansWithCustomer += qty;
     }
 
@@ -864,46 +884,44 @@ export class CustomersService {
     tenantId: string,
     rows: OpeningContainerInputDto[],
   ): Promise<void> {
-    const ids = rows.map((row) => row.productId);
+    const ids = rows.map((row) => row.packagingTypeId);
     if (new Set(ids).size !== ids.length) {
-      throw new BadRequestException('Each product can appear only once in openingContainers');
+      throw new BadRequestException(
+        'Each packaging type can appear only once in openingContainers',
+      );
     }
-    const products = await tx.product.findMany({
+    const types = await tx.packagingType.findMany({
       where: {
         tenantId,
         deletedAt: null,
         isActive: true,
-        isReturnable: true,
         id: { in: ids },
       },
       select: { id: true },
     });
-    if (products.length !== ids.length) {
+    if (types.length !== ids.length) {
       throw new BadRequestException(
-        'openingContainers must use active returnable products in this workspace',
+        'openingContainers must use active packaging types in this workspace',
       );
     }
   }
 
-  private async assertReturnableProduct(
+  private async assertActivePackagingType(
     db: PrismaService | Prisma.TransactionClient,
     tenantId: string,
-    productId: string,
+    packagingTypeId: string,
   ): Promise<void> {
-    const product = await db.product.findFirst({
+    const type = await db.packagingType.findFirst({
       where: {
-        id: productId,
+        id: packagingTypeId,
         tenantId,
         deletedAt: null,
         isActive: true,
-        isReturnable: true,
       },
       select: { id: true },
     });
-    if (!product) {
-      throw new BadRequestException(
-        'Product must be an active returnable product in this workspace',
-      );
+    if (!type) {
+      throw new BadRequestException('Packaging type must be active in this workspace');
     }
   }
 

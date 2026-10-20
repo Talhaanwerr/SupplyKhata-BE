@@ -35,8 +35,12 @@ export class DeliveryRunsController {
 
   @Get()
   @RequirePermissions('deliveryruns:read')
-  list(@Query() query: ListDeliveryRunsQueryDto, @CurrentTenant() tenantId: string) {
-    return this.deliveryRunsService.list(tenantId, query);
+  list(
+    @Query() query: ListDeliveryRunsQueryDto,
+    @CurrentTenant() tenantId: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.deliveryRunsService.list(tenantId, query, user.id);
   }
 
   /** Static path — must stay above `:id` so Nest does not treat it as a run id. */
@@ -51,8 +55,12 @@ export class DeliveryRunsController {
 
   @Get(':id')
   @RequirePermissions('deliveryruns:read')
-  findOne(@Param('id') id: string, @CurrentTenant() tenantId: string) {
-    return this.deliveryRunsService.findOne(id, tenantId);
+  findOne(
+    @Param('id') id: string,
+    @CurrentTenant() tenantId: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.deliveryRunsService.findOne(id, tenantId, user.id);
   }
 
   @Patch(':id')
@@ -79,8 +87,12 @@ export class DeliveryRunsController {
 
   @Get(':id/summary')
   @RequirePermissions('deliveryruns:read')
-  summary(@Param('id') id: string, @CurrentTenant() tenantId: string) {
-    return this.deliveryRunsService.summary(id, tenantId);
+  summary(
+    @Param('id') id: string,
+    @CurrentTenant() tenantId: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.deliveryRunsService.summary(id, tenantId, user.id);
   }
 
   @Post(':id/include-planned-stops')

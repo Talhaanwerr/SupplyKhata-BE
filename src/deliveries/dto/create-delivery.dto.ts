@@ -99,9 +99,12 @@ export class CreateDeliveryDto {
   @IsString()
   plannedStopId?: string;
 
-  @ApiProperty({ type: [CreateDeliveryItemDto] })
+  @ApiProperty({
+    type: [CreateDeliveryItemDto],
+    description: 'May be empty when collecting cash/dues only (cashReceived > 0)',
+  })
   @IsArray()
-  @ArrayMinSize(1)
+  @ArrayMinSize(0)
   @ArrayMaxSize(100)
   @ValidateNested({ each: true })
   @Type(() => CreateDeliveryItemDto)

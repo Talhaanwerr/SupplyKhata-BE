@@ -90,8 +90,8 @@ export class RolesController {
 
   @Get('/permissions/list')
   @RequirePermissions('permissions:read')
-  listPermissions(@CurrentUser() user: AuthenticatedUser) {
-    return this.rolesService.listPermissions(user.isSuperAdmin);
+  listPermissions(@CurrentUser() user: AuthenticatedUser, @CurrentTenant() tenantId: string) {
+    return this.rolesService.listPermissions(user.isSuperAdmin, tenantId);
   }
 
   @Post(':id/permissions')
